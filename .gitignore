@@ -1,0 +1,30 @@
+# --- Environment & Secrets ---
+.env
+.env.local
+
+# --- Python & Bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# --- Virtual Environments ---
+.venv/
+env/
+venv/
+
+# --- Workspace Runtime Files (Optional: ignore agent output files if needed) ---
+# workspace/*
+# !workspace/.gitkeep
+
+# --- IDE / VS Code ---
+.history/
+.vscode/
+
+# --- OS Generated Files ---
+.DS_Store
+Thumbs.db
