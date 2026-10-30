@@ -18,7 +18,7 @@ env/
 venv/
 
 # --- Workspace Runtime Files (Optional: ignore agent output files if needed) ---
-# workspace/*
+workspace/
 # !workspace/.gitkeep
 
 # --- IDE / VS Code ---
