@@ -71,4 +71,21 @@ TOOL_SCHEMAS = [
         }
     }
 },
+{
+    "type": "function",
+    "function": {
+        "name": "run_python_script",
+        "description": "Execute a Python script file in the workspace and return its output.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "script_path": {
+                    "type": "string",
+                    "description": "The path to the python script file (e.g. 'inspect_teams.py')."
+                }
+            },
+            "required": ["script_path"]
+        }
+    }
+},
 ]

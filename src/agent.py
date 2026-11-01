@@ -6,7 +6,7 @@ robust error handling for argument parsing, and iterative model reasoning.
 import json
 from src.llm_client import get_llm_client
 from src.tool_schemas import TOOL_SCHEMAS
-from src.tools import list_files, read_file, write_file
+from src.tools import list_files, read_file, write_file, run_python_script
 from src.memory import load_memory, save_memory
 
 # Map function name strings to actual Python callables
@@ -15,6 +15,7 @@ TOOL_MAP = {
     "read_file": read_file,
     "write_file": write_file,
     "save_memory": save_memory,
+    "run_python_script": run_python_script,
 }
 
 def run_agent(user_prompt: str, messages: list) -> str:
@@ -44,12 +45,21 @@ def run_agent(user_prompt: str, messages: list) -> str:
         # Dynamically inject the latest persistent memory into the system prompt
         memory_content = load_memory()
         system_prompt = (
-            "You are a helpful, autonomous local AI coding agent running inside a sandboxed workspace directory. "
-            "You have access to tools to list files, read files, write files, and save persistent notes to memory. "
-            "Always use your tools when requested or when necessary to complete a task.\n\n"
-            f"--- Persistent Memory ---\n{memory_content}"
+            f"""You are an autonomous, expert Data Science AI Agent operating inside a local workspace.
+Your primary objective is to assist with data exploration, analysis, machine learning scripting, data cleaning, and reporting.
+
+GUIDELINES & BEHAVIOR:
+1. Workspace Scope: You operate inside a sandboxed workspace directory. Use your tools (`list_files`, `read_file`, `write_file`) to inspect, load, and edit datasets or scripts.
+2. Tool Discipline: Always check the contents of a directory or file before making assumptions about schemas or columns.
+3. Code Execution & Data Analysis: Write clean, vectorized Python code using standard data science libraries (pandas, numpy, scikit-learn).
+4. Memory Management: Utilize `save_memory` to store crucial insight highlights, column definitions, or data stats so they persist across user turns.
+5. Precision: Be explicit, accurate, and concise in your explanations. Never invent or summarize columns you haven't explicitly verified via file inspection.
+6. Never use read_file to read large CSV datasets directly into the chat. Always write a Python script using pandas to inspect, query, or process CSV files locally.
+
+--- Persistent Memory ---
+{memory_content}"""
         )
-        
+
         # Construct the payload message stack (System prompt + full conversation history)
         payload_messages = [{"role": "system", "content": system_prompt}] + messages
         

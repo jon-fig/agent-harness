@@ -1,4 +1,4 @@
-import os
+import os, subprocess
 from pathlib import Path
 from src.config import WORKSPACE_DIR
 
@@ -58,3 +58,26 @@ def write_file(file_path: str, content: str) -> str:
         return f"Success: File '{file_path}' was successfully written."
     except Exception as e:
         return f"Error writing file '{file_path}': {str(e)}"
+
+def run_python_script(script_path: str) -> str:
+    """Execute a python script in the workspace and return its stdout/stderr with path fallback."""
+    try:
+        # Check if file exists directly, otherwise check inside 'workspace/' folder
+        target_path = script_path
+        if not os.path.exists(target_path):
+            alt_path = os.path.join("workspace", script_path)
+            if os.path.exists(alt_path):
+                target_path = alt_path
+
+        result = subprocess.run(
+            ["python", target_path], 
+            capture_output=True, 
+            text=True, 
+            timeout=15
+        )
+        output = f"STDOUT:\n{result.stdout}"
+        if result.stderr:
+            output += f"\nSTDERR:\n{result.stderr}"
+        return output
+    except Exception as e:
+        return f"Execution error: {str(e)}"
