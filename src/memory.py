@@ -14,12 +14,12 @@ def load_memory() -> str:
     except Exception as e:
         return f"Error reading memory file: {str(e)}"
 
-def save_memory(note: str) -> str:
+def save_memory(memory: str) -> str:
     """Appends a new note or detail to the persistent memory file."""
     try:
         content = load_memory()
-        updated_content = content.strip() + f"\n- {note}\n"
+        updated_content = content.strip() + f"\n- {memory}\n"
         MEMORY_FILE.write_text(updated_content, encoding="utf-8")
-        return f"Success: Added note to memory: '{note}'"
+        return f"Success: Added note to memory: '{memory}'"
     except Exception as e:
         return f"Error updating memory file: {str(e)}"

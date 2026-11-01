@@ -54,4 +54,21 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+    "type": "function",
+    "function": {
+        "name": "save_memory",
+        "description": "Saves an important note, user preference, or insight to persistent memory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "memory": {
+                    "type": "string",
+                    "description": "The specific detail or insight to remember."
+                }
+            },
+            "required": ["memory"]
+        }
+    }
+},
 ]

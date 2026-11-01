@@ -38,6 +38,10 @@ def read_file(file_path: str) -> str:
             return f"Error: '{file_path}' is a directory, not a file."
             
         content = safe_path.read_text(encoding="utf-8")
+        
+        # If the file is too big, truncate the preview sent to the LLM
+        if len(content) > 2000:
+            return f"[File truncated for size. Total length: {len(content)} chars]\nPreview:\n{content[:1500]}\n..."
         return content
     except Exception as e:
         return f"Error reading file '{file_path}': {str(e)}"
