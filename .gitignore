@@ -14,11 +14,14 @@ dist/
 
 # --- Virtual Environments ---
 .venv/
+.venv-mcp/
 env/
 venv/
 
+# --- Agent conversation state (see src/session.py) ---
+.agent/
+
 # --- Workspace Runtime Files (Optional: ignore agent output files if needed) ---
-workspace/
 # !workspace/.gitkeep
 
 # --- IDE / VS Code ---

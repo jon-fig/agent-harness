@@ -1,2 +1,13 @@
 openai>=1.0.0
 python-dotenv>=1.0.0
+
+# Exact token counts for the input budget (falls back to chars/4 if absent).
+tiktoken>=0.7.0
+
+# MCP client used by src/mcp_client.py to talk to the tool server over stdio.
+mcp>=2.0.0,<3
+
+# The MCP server keeps its own dependency set (it requires mcp<2), so it lives in a
+# separate virtualenv instead of in this file:
+#   python -m venv .venv-mcp
+#   .venv-mcp/Scripts/python.exe -m pip install "mcp<2" mcp-python-interpreter
