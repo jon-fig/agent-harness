@@ -23,11 +23,12 @@ import time
 import types
 import uuid
 
-from src import config, models, usage
-from src.budget import build_payload
-from src.config import LLM_MAX_RETRIES, MAX_OUTPUT_TOKENS, MEMORY_MAX_CHARS
+from src import config, models, providers, tokenization, usage
+from src.budget import build_payload, compact_history, maybe_auto_compact
+from src.config import LLM_MAX_RETRIES, MEMORY_MAX_CHARS
 from src.llm_client import get_llm_client
 from src.memory import backup_current, load_memory, save_memory
+from src.usage_report import TokenUsage
 
 # Harness state (memory) is not a file/exec operation, so it stays in-process even
 # though every filesystem and Python tool is served over MCP.
@@ -108,13 +109,17 @@ class AgentError(RuntimeError):
 # Groq reports the remaining tokens of the rolling window on every response. Using
 # them turns "the model stops around 8K" from a guess into a number we can act on.
 _DURATION = re.compile(r"(?:(\d+)m)?([\d.]+)s")
-# Windows are per model on Groq, so pacing state is keyed by model id: switching
-# with /model must not inherit another model's remaining tokens.
+# Windows are per provider *and* per model, so pacing state is keyed by both:
+# switching model or /provider must not inherit another endpoint's budget.
 _RATE: dict[str, dict] = {}
 
 
-def _rate_state(model_name: str) -> dict:
-    return _RATE.setdefault(model_name, {"remaining": None, "reset_at": 0.0})
+def _rate_key(provider: str, model_name: str) -> str:
+    return f"{provider}:{model_name}"
+
+
+def _rate_state(model_key: str) -> dict:
+    return _RATE.setdefault(model_key, {"remaining": None, "reset_at": 0.0})
 
 
 def _seconds_from_header(value) -> float:
@@ -130,7 +135,7 @@ def _seconds_from_header(value) -> float:
         return 0.0
 
 
-def _note_rate_limit(model_name: str, headers) -> None:
+def _note_rate_limit(model_key: str, headers) -> None:
     """Remembers how much of this model's per-minute token bucket is left."""
     if headers is None:
         return
@@ -140,7 +145,7 @@ def _note_rate_limit(model_name: str, headers) -> None:
         return
     if raw_remaining is None:
         return
-    state = _rate_state(model_name)
+    state = _rate_state(model_key)
     try:
         state["remaining"] = int(float(raw_remaining))
     except (TypeError, ValueError):
@@ -150,13 +155,13 @@ def _note_rate_limit(model_name: str, headers) -> None:
         state["reset_at"] = time.monotonic() + reset
 
 
-def _pace_before_request(model_name: str, approx_input: int) -> None:
+def _pace_before_request(model_key: str, approx_input: int, max_output: int) -> None:
     """Waits out the window instead of provoking a 429 the retry loop must absorb."""
-    state = _rate_state(model_name)
+    state = _rate_state(model_key)
     remaining = state["remaining"]
     if remaining is None:
         return
-    needed = approx_input + MAX_OUTPUT_TOKENS
+    needed = approx_input + max_output
     if remaining >= needed:
         return
 
@@ -235,7 +240,9 @@ def get_tooling():
 
         if name in HARNESS_TOOL_MAP:
             return HARNESS_TOOL_MAP[name](**arguments)
-        return bridge.call(name, arguments)
+        # Resolved per call so a bridge that died mid-turn is replaced instead of
+        # failing every later tool call in the turn.
+        return get_bridge().call(name, arguments)
 
     return schemas, dispatch
 
@@ -455,16 +462,17 @@ def _retry_after_seconds(headers, fallback: float) -> float:
     return fallback
 
 
-def _log_usage(approx_input: int, response, headers, model_name: str | None = None) -> None:
+def _log_usage(
+    approx_input: int,
+    token_usage: TokenUsage,
+    headers,
+    model_name: str | None = None,
+) -> None:
     if not config.DEBUG_TOKENS:
         return
-    usage = getattr(response, "usage", None)
-    prompt = getattr(usage, "prompt_tokens", "?")
-    completion = getattr(usage, "completion_tokens", "?")
-    total = getattr(usage, "total_tokens", "?")
 
-    # A large gap between approx and prompt means the estimator needs tuning (or a
-    # different tokenizer); the headers show how much room is left for next time.
+    # A large gap between the estimate and the reported prompt means the
+    # tokenizer needs attention; the headers show how much room is left.
     headroom = ""
     if headers is not None:
         try:
@@ -477,8 +485,8 @@ def _log_usage(approx_input: int, response, headers, model_name: str | None = No
 
     prefix = f"{model_name} " if model_name else ""
     print(
-        f"[Tokens] {prefix}approx input={approx_input} prompt={prompt} "
-        f"completion={completion} total={total}{headroom}"
+        f"[Tokens] {prefix}estimated_input={approx_input} "
+        f"reported={token_usage.describe()}{headroom}"
     )
 
 
@@ -499,6 +507,8 @@ def _prepare_payload(
     budget,
     allow_tools,
     keep_options=(config.HISTORY_KEEP_EXCHANGES, 1, 0),
+    model_id=None,
+    provider=None,
 ):
     """Returns (payload, approx_tokens, fits, use_tools).
 
@@ -508,13 +518,26 @@ def _prepare_payload(
     """
     if allow_tools:
         payload, approx, fits = build_payload(
-            system_prompt, messages, tool_schemas, budget, keep_options
+            system_prompt,
+            messages,
+            tool_schemas,
+            budget,
+            keep_options,
+            model_id=model_id,
+            provider=provider,
         )
         if fits:
             return payload, approx, True, True
 
     payload, approx, fits = build_payload(
-        system_prompt, messages, tool_schemas, budget, keep_options, include_tools=False
+        system_prompt,
+        messages,
+        tool_schemas,
+        budget,
+        keep_options,
+        include_tools=False,
+        model_id=model_id,
+        provider=provider,
     )
     if allow_tools and fits:
         print("[Agent] Input does not fit with the tool block; sending without tools to force an answer.")
@@ -523,11 +546,12 @@ def _prepare_payload(
 
 def _request_completion(
     client,
+    provider,
     model_name,
     system_prompt,
     messages,
     tool_schemas,
-    budget,
+    budget: models.RequestBudget,
     allow_tools=True,
 ):
     """Calls the provider once, surviving the free tier's limits.
@@ -537,29 +561,84 @@ def _request_completion(
     provider says. 5xx: bounded backoff. The client is built with max_retries=0 so
     these decisions are made here, visibly, instead of inside the SDK.
     """
-    # Daily allowance first: a spent RPD/TPD window resets at midnight UTC, which
-    # no amount of waiting inside this turn can fix.
-    blocked = usage.guard(model_name)
-    if blocked:
-        raise BudgetExceeded(blocked)
+    model_key = _rate_key(provider, model_name)
+
+    # Automatic compaction is a request-path decision: it must see the system
+    # prompt, the tool schemas and the whole history before it can know whether
+    # the next request is expensive.
+    compaction = maybe_auto_compact(
+        system_prompt,
+        messages,
+        tool_schemas,
+        budget,
+        model_id=model_name,
+        provider=provider,
+        allow_tools=allow_tools,
+    )
+    if compaction.changed:
+        messages[:] = compaction.messages
+        print(
+            f"[Session] Auto-compacted ({compaction.reason}; {compaction.turns} turns): "
+            f"~{compaction.before_tokens} -> ~{compaction.after_tokens} tokens "
+            f"(target {compaction.target_tokens:.0f})."
+        )
+    elif (
+        config.DEBUG_TOKENS
+        and compaction.eligible
+        and compaction.before_tokens > compaction.threshold_tokens
+    ):
+        print(
+            f"[Session] Auto-compaction did not reduce the request further "
+            f"(~{compaction.after_tokens} tokens): {compaction.reason}."
+        )
 
     payload, approx, fits, use_tools = _prepare_payload(
-        system_prompt, messages, tool_schemas, budget, allow_tools
+        system_prompt,
+        messages,
+        tool_schemas,
+        budget,
+        allow_tools,
+        model_id=model_name,
+        provider=provider,
     )
     if not fits:
         raise BudgetExceeded(
-            f"the conversation needs ~{approx} input tokens and the budget is {budget}"
+            f"the complete request needs ~{approx} input tokens but the budget is "
+            f"{budget.max_input_tokens} (context "
+            f"{budget.context_window or 'unknown'}, max output "
+            f"{budget.max_output_tokens}); auto-compaction could not reduce it "
+            "enough. Use /clear or choose a model with a larger context window."
         )
+
+    # Project the request that is about to be sent, not only the totals already
+    # recorded: input estimate plus the reserved output.
+    projected_tokens = approx + budget.max_output_tokens
+    blocked = usage.guard(
+        model_name,
+        provider,
+        projected_tokens=projected_tokens,
+        projected_requests=1,
+    )
+    if blocked:
+        raise BudgetExceeded(blocked)
 
     attempt = 0
     delay = 2.0
     shrunk = False
+    # OpenAI's newer reasoning models reject max_tokens and want
+    # max_completion_tokens instead. Most compatible providers accept the old
+    # name, so it is the default and the fallback is driven by the error text.
+    output_field = "max_tokens"
 
     while attempt <= LLM_MAX_RETRIES:
         attempt += 1
-        _pace_before_request(model_name, approx)
+        _pace_before_request(model_key, approx, budget.max_output_tokens)
 
-        kwargs = {"model": model_name, "messages": payload, "max_tokens": MAX_OUTPUT_TOKENS}
+        kwargs = {
+            "model": model_name,
+            "messages": payload,
+            output_field: budget.max_output_tokens,
+        }
         if use_tools:
             kwargs["tools"] = tool_schemas
             kwargs["tool_choice"] = "auto"
@@ -569,9 +648,28 @@ def _request_completion(
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             headers = getattr(getattr(exc, "response", None), "headers", None) or {}
+            error_text = str(exc).lower()
+
+            if (
+                status == 400
+                and output_field == "max_tokens"
+                and "max_tokens" in error_text
+                and (
+                    "max_completion_tokens" in error_text
+                    or "not supported" in error_text
+                    or "unsupported" in error_text
+                )
+            ):
+                output_field = "max_completion_tokens"
+                print(
+                    "[Agent] Provider rejected max_tokens; retrying with "
+                    "max_completion_tokens."
+                )
+                continue
 
             if status == 413 and not shrunk:
                 shrunk = True
+                messages[:] = compact_history(messages, 0)
                 payload, approx, fits, use_tools = _prepare_payload(
                     system_prompt,
                     messages,
@@ -579,10 +677,14 @@ def _request_completion(
                     budget,
                     allow_tools and use_tools,
                     keep_options=(0,),
+                    model_id=model_name,
+                    provider=provider,
                 )
                 if not fits:
                     raise BudgetExceeded(
-                        f"the request was rejected as too large (~{approx} input tokens)"
+                        f"the provider rejected the request as too large and "
+                        f"compaction still leaves ~{approx} input tokens "
+                        f"(budget {budget.max_input_tokens})."
                     ) from exc
                 print(
                     f"[Agent] Request too large; compacted history to ~{approx} tokens and retrying."
@@ -605,22 +707,35 @@ def _request_completion(
 
             raise
         else:
-            _note_rate_limit(model_name, headers)
-            _log_usage(approx, response, headers, model_name)
+            token_usage = TokenUsage.from_response(response)
+            _note_rate_limit(model_key, headers)
+            _log_usage(approx, token_usage, headers, model_key)
+            # Learn this model's real chars/token ratio from the provider's own
+            # count, so a fallback estimate stops undercounting later requests.
+            if token_usage.input:
+                tokenization.record_calibration(
+                    model_name,
+                    provider,
+                    tokenization.request_characters(
+                        payload, tool_schemas if use_tools else None
+                    ),
+                    token_usage.input,
+                )
             usage.record(
                 model_name,
-                getattr(getattr(response, "usage", None), "prompt_tokens", 0),
-                getattr(getattr(response, "usage", None), "completion_tokens", 0),
+                token_usage,
+                provider=provider,
+                estimated_tokens=approx,
             )
             return response
 
     raise RuntimeError(f"LLM provider kept failing after {LLM_MAX_RETRIES} retries.")
 
 
-def _truncation_notice() -> str:
+def _truncation_notice(max_output: int) -> str:
     """Marks an answer the provider cut off, instead of passing it off as complete."""
     return (
-        f"\n\n[Answer truncated at MAX_OUTPUT_TOKENS={MAX_OUTPUT_TOKENS}. "
+        f"\n\n[Answer truncated at the model's {max_output}-token output limit. "
         "Ask for the rest, or raise that limit for one turn.]"
     )
 
@@ -634,18 +749,14 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
     daily allowance, truncated tool call). Returning that text as if it were an
     answer made a failed turn look successful, and saved it as history.
     """
-    provider = (provider or config.LLM_PROVIDER).lower()
+    provider = providers.normalize(provider or config.LLM_PROVIDER)
     client, model_name = get_llm_client(provider)
     tool_schemas, dispatch_tool = get_tooling()
 
-    # Ollama has no tokens-per-minute ceiling, only a context window, so the tiny
-    # Groq budget would make local iteration needlessly awkward. On Groq the budget
-    # follows the active model's own TPM, so /model changes it immediately.
-    budget = (
-        config.OLLAMA_MAX_INPUT_TOKENS
-        if provider == "ollama"
-        else models.input_budget(model_name)
-    )
+    # Split the limits into the request-size budget (context/input/output) and
+    # the provider's rate limits. Each provider/model can override either without
+    # changing the other.
+    budget = models.request_budget(model_name, provider)
 
     # Append the new user message to the history
     messages.append({"role": "user", "content": user_prompt})
@@ -661,8 +772,12 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
         pass  # older servers may not expose it
 
     max_iterations = config.MAX_ITERATIONS
-    # Per turn: an identical repeat cannot return anything the model has not seen,
-    # so it is not executed again.
+    # MAX_ITERATIONS bounds model calls, not tool executions: a single response can
+    # ask for many calls, so executions have their own ceiling per turn.
+    max_tool_calls = max(1, config.MAX_TOOL_CALLS_PER_TURN)
+    executed_tool_calls = 0
+    # Only used when DEDUPE_TOOL_CALLS is enabled: identical arguments do not
+    # guarantee identical results, so repeats execute by default.
     seen: dict[tuple[str, str], str] = {}
 
     # Agentic loop. The last iteration gets no tools, so the model has to write
@@ -674,6 +789,7 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
         try:
             response = _request_completion(
                 client,
+                provider,
                 model_name,
                 iteration_prompt,
                 messages,
@@ -705,8 +821,9 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
         # write_file body would replace a good file with a broken one.
         if finish_reason == "length" and detected_tool_calls:
             message = (
-                f"I reached MAX_OUTPUT_TOKENS ({MAX_OUTPUT_TOKENS}) while composing a tool call, "
-                "so I did not run it. Ask me to retry that step in smaller pieces."
+                f"I reached the {budget.max_output_tokens}-token output limit while "
+                "composing a tool call, so I did not run it. Ask me to retry that "
+                "step in smaller pieces."
             )
             print(f"[Agent Warning] {message}")
             messages.append({"role": "assistant", "content": message})
@@ -766,7 +883,17 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
                     continue
 
                 key = (function_name, json.dumps(arguments, sort_keys=True, default=str))
-                if key in seen:
+                if executed_tool_calls >= max_tool_calls:
+                    tool_result = (
+                        f"Error: this turn reached its limit of {max_tool_calls} tool "
+                        f"executions, so '{function_name}' was not run. Summarise what "
+                        "is done and continue in the next turn."
+                    )
+                    print(
+                        f"[Agent Warning] Per-turn tool-call limit reached "
+                        f"({max_tool_calls}); '{function_name}' was not executed."
+                    )
+                elif config.DEDUPE_TOOL_CALLS and key in seen:
                     earlier = seen[key]
                     head = (
                         earlier
@@ -786,6 +913,7 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
                         tool_result = f"Error: Tool '{function_name}' does not exist in the environment."
                     except Exception as tool_exc:
                         tool_result = f"Error executing tool '{function_name}': {str(tool_exc)}"
+                    executed_tool_calls += 1
                     seen[key] = str(tool_result)
 
                 preview = str(tool_result)[:150].replace('\n', ' ')
@@ -810,8 +938,8 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
             messages.append({"role": "assistant", "content": content})
             if finish_reason == "length":
                 print(
-                    f"[Agent Warning] Answer hit MAX_OUTPUT_TOKENS ({MAX_OUTPUT_TOKENS}); "
-                    "it is truncated."
+                    f"[Agent Warning] Answer hit the {budget.max_output_tokens}-token "
+                    "output limit; it is truncated."
                 )
-                return content + _truncation_notice()
+                return content + _truncation_notice(budget.max_output_tokens)
             return content

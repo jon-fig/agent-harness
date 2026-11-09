@@ -4,100 +4,152 @@ CLI entrypoint for the custom agentic harness.
 Keeps the conversation across prompts, persists it to .agent/session.json so long
 work survives a restart, and provides /clear and /compact because the history is
 the main input-token cost on a metered provider.
+
+Provider selection is deliberately not a fixed list: /provider switches between
+any endpoints configured in .env, and /model list asks the active provider for its
+real catalogue over GET /models.
 """
 
 import argparse
 
-from src import config, models, usage
+from src import config, models, providers, usage
 from src.agent import AgentError, run_agent
 from src.budget import compact_history, estimate_tokens
+from src.llm_client import list_models
 from src.session import clear_session_file, load_session, save_session
 
 HELP = """Commands:
-  /model            show the active model and the bundled options
-  /model <id>       switch model (/model 20b, /model qwen, or a full Groq id)
+  /model            show the active model, provider and bundled options
+  /model list       ask the provider for its catalogue (GET /models)
+  /model <id|#>     switch model (id, alias, or a number from /model list)
+  /provider         show the active provider and the other configured ones
+  /provider <name>  switch provider for this session
   /clear            forget the conversation (and delete the saved session)
   /compact          collapse older tool exchanges now, keeping the latest ones verbatim
   /help             show this help
   exit              quit (history is saved automatically)"""
 
-
-def _describe(messages: list) -> str:
-    tokens = estimate_tokens(messages) if messages else 0
-    return f"{len(messages)} messages, ~{tokens} tokens"
+# Model ids fetched during this session, used to resolve "/model 7".
+_MODEL_CACHE: dict[str, list[str]] = {}
 
 
-def _auto_compact(messages: list, provider: str) -> None:
-    """Collapses old tool exchanges once a session gets expensive.
-
-    Two triggers, whichever comes first: the configured turn count (default 3) or
-    the history passing a fraction of the input budget. On an 8K TPM free tier the
-    token trigger usually fires first, because a single turn of tool output can
-    cost more than several ordinary turns.
-    """
+def _describe(messages: list, provider: str) -> str:
     if not messages:
-        return
+        return "empty"
+    model_id = models.active(provider)
+    estimate = estimate_tokens(messages, model_id=model_id, provider=provider)
+    return f"{len(messages)} messages, ~{estimate:,} tokens"
 
-    turns = sum(1 for message in messages if message.get("role") == "user") + 1
-    budget = (
-        config.OLLAMA_MAX_INPUT_TOKENS
-        if provider == "ollama"
-        else models.input_budget(models.active())
-    )
-    before_tokens = estimate_tokens(messages)
-    threshold = budget * config.AUTOCOMPACT_TOKEN_FRACTION
-    by_turns = turns >= config.AUTOCOMPACT_AFTER_TURNS
-    if not by_turns and before_tokens <= threshold:
-        return
 
-    messages[:] = compact_history(messages)
-    after_tokens = estimate_tokens(messages)
-    if after_tokens >= before_tokens:
-        return  # nothing old enough to collapse
+def _budget_line(provider: str) -> str:
+    """One-line request budget for the active model."""
+    model_id = models.active(provider)
+    budget = models.request_budget(model_id, provider)
+    return budget.describe()
 
-    reason = f"turn {turns}" if by_turns else f"~{before_tokens} history tokens > {threshold:.0f}"
-    print(
-        f"[Session] Auto-compacted ({reason}): ~{before_tokens} -> ~{after_tokens} tokens."
-    )
+
+def _fetch_models(provider: str) -> list[str]:
+    """Fetches the provider's catalogue and prints a numbered chooser."""
+    try:
+        endpoint = providers.resolve(provider)
+    except ValueError as exc:
+        print(f"[Model] {exc}")
+        return []
+
+    print(f"[Model] Querying {endpoint.base_url}/models ...")
+    try:
+        ids = list_models(provider)
+    except RuntimeError as exc:
+        print(f"[Model] {exc}")
+        return []
+
+    _MODEL_CACHE[provider] = ids
+    if not ids:
+        print("[Model] The provider returned an empty catalogue.")
+        return []
+
+    current = models.active(provider)
+    print(f"[Model] {len(ids)} models available from {endpoint.label}:")
+    for index, model_id in enumerate(ids, start=1):
+        marker = "*" if model_id == current else " "
+        print(f" {marker} {index:>3}. {model_id}")
+    print("Switch with: /model <id> or /model <number>.")
+    return ids
 
 
 def _handle_model(argument: str, provider: str) -> None:
-    """`/model` with no argument reports; with an argument it switches."""
-    if provider == "ollama":
-        if not argument:
-            print(f"[Model] Ollama model: {config.OLLAMA_MODEL}")
-            print("        Switch with /model <name>; Groq models need --provider groq.")
-            return
-        config.OLLAMA_MODEL = argument
-        print(f"[Model] Ollama model -> {argument} (applies from the next turn)")
+    """`/model` reports, `/model list` discovers, anything else switches."""
+    provider = providers.normalize(provider)
+
+    if argument.lower() in ("list", "ls", "refresh"):
+        _fetch_models(provider)
         return
 
     if not argument:
-        print(models.describe_active())
-        print(f"        {usage.describe(models.active())}")
-        print(models.table())
+        print(models.describe_active(provider))
+        print(f"        {usage.describe(models.active(provider), provider)}")
+        print(models.table(provider))
+        cached = _MODEL_CACHE.get(provider)
+        if cached:
+            print(f"        last fetched list: {len(cached)} models (use /model <number>)")
         return
 
+    # A number refers to the last /model list for this provider.
+    cached = _MODEL_CACHE.get(provider, [])
+    if argument.isdigit() and cached:
+        index = int(argument)
+        if not 1 <= index <= len(cached):
+            print(f"[Model] No entry #{index}; the last list has {len(cached)} models.")
+            return
+        argument = cached[index - 1]
+
     try:
-        model_id = models.set_active(argument)
+        model_id = models.set_active(argument, provider)
     except ValueError as exc:
         print(f"[Model] {exc}. Type /model to list options.")
         return
 
-    spec = models.spec_for(model_id)
-    if spec is None:
+    endpoint = providers.resolve(provider)
+    budget = models.request_budget(model_id, provider)
+    if models.spec_for(model_id, provider) is None:
         print(
-            f"[Model] Active -> {model_id} (not in the bundled catalog; "
-            f"budget falls back to {config.MAX_INPUT_TOKENS} tokens/request)."
+            f"[Model] Active -> {model_id} on {endpoint.label} "
+            f"({budget.describe()})."
         )
+        print(f"        {usage.describe(model_id, provider)}")
         return
 
     print(
-        f"[Model] Active -> {spec.id} | input budget {models.input_budget(model_id)} "
-        f"tokens/request | {spec.tpm:,} TPM"
+        f"[Model] Active -> {model_id} | {budget.describe()}"
     )
-    print(f"        {usage.describe(model_id)}")
-    print("        Pacing state is per model, so switching does not inherit a used window.")
+    print(f"        {usage.describe(model_id, provider)}")
+    print("        Pacing state is per provider/model, so switching does not inherit a used window.")
+
+
+def _handle_provider(argument: str, provider: str) -> str:
+    """`/provider` reports, `/provider <name>` switches for this session."""
+    if not argument:
+        try:
+            endpoint = providers.resolve(provider)
+            print(f"[Provider] Active -> {endpoint.describe()}")
+        except ValueError as exc:
+            print(f"[Provider] {exc}")
+        print(providers.describe_all(provider))
+        print(f"        Known presets: {', '.join(sorted(providers.PRESETS))}")
+        return provider
+
+    try:
+        endpoint = providers.resolve(argument)
+    except ValueError as exc:
+        print(f"[Provider] {exc}")
+        return provider
+
+    active = models.active(endpoint.name)
+    budget = models.request_budget(active, endpoint.name)
+    print(f"[Provider] Active -> {endpoint.describe()}")
+    print(f"        model: {active} | {budget.describe()}")
+    print("        The conversation is kept; the next turn uses this endpoint.")
+    return endpoint.name
 
 
 def main():
@@ -109,33 +161,67 @@ def main():
     )
     parser.add_argument(
         "--provider",
-        choices=("groq", "ollama"),
-        help="override LLM_PROVIDER for this run (ollama has no tokens-per-minute ceiling)",
+        help=(
+            "OpenAI-compatible provider to use for this run (groq, nvidia, openai, "
+            "openrouter, together, deepseek, mistral, cerebras, fireworks, "
+            "perplexity, ollama, or any custom name)"
+        ),
     )
     parser.add_argument("--no-session", action="store_true", help="start from an empty history")
     parser.add_argument(
         "--model",
-        help="Groq model id or alias for this and later runs (overrides .env)",
+        help="model id or alias for this provider for this and later runs (overrides .env)",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="print the provider's GET /models catalogue and exit",
+    )
+    parser.add_argument(
+        "--list-providers",
+        action="store_true",
+        help="print the providers configured in this environment and exit",
     )
     args = parser.parse_args()
 
     if args.debug_tokens:
         config.DEBUG_TOKENS = True
 
-    provider = (args.provider or config.LLM_PROVIDER).lower()
+    provider = providers.normalize(args.provider or config.LLM_PROVIDER)
+    try:
+        endpoint = providers.resolve(provider)
+    except ValueError as exc:
+        raise SystemExit(f"[Provider Error] {exc}")
+
+    if args.list_providers:
+        print(f"[Provider] Active -> {endpoint.describe()}")
+        print(providers.describe_all(provider))
+        return
+
+    if args.list_models:
+        try:
+            for model_id in list_models(provider):
+                print(model_id)
+        except RuntimeError as exc:
+            raise SystemExit(f"[Model Error] {exc}")
+        return
+
     if args.model:
         try:
-            models.set_active(args.model)
+            models.set_active(args.model, provider)
         except ValueError as exc:
             raise SystemExit(f"--model: {exc}")
 
     messages = [] if args.no_session else load_session()
-    history = _describe(messages) if messages else "empty"
-    active_model = config.OLLAMA_MODEL if provider == "ollama" else models.active()
+    history = _describe(messages, provider)
+    active_model = models.active(provider)
+    key_source = endpoint.api_key_source or ("not required" if endpoint.local else "missing")
 
     print("==================================================")
     print("🤖 Custom Python AI Agent Harness Initialized")
-    print(f"Provider: {provider} | model: {active_model} | history: {history}")
+    print(f"Provider: {endpoint.label} ({endpoint.name}) | {endpoint.base_url}")
+    print(f"Auth: {key_source} | model: {active_model}")
+    print(f"Budget: {_budget_line(provider)} | history: {history}")
     print("Type /help for commands, or 'exit' / 'quit' to close.")
     print("==================================================\n")
 
@@ -160,29 +246,39 @@ def main():
             continue
 
         if command == "/clear":
-            before = _describe(messages)
+            before = _describe(messages, provider)
             messages.clear()
             clear_session_file()
             print(f"[Session] Cleared ({before} -> empty).")
             continue
 
         if command == "/compact":
-            before = _describe(messages)
+            before = _describe(messages, provider)
             messages[:] = compact_history(messages)
             save_session(messages)
-            print(f"[Session] Compacted ({before} -> {_describe(messages)}).")
+            print(f"[Session] Compacted ({before} -> {_describe(messages, provider)}).")
             continue
 
-        if command == "/model" or command.startswith("/model "):
+        if (
+            command in ("/model", "/models")
+            or command.startswith("/model ")
+            or command.startswith("/models ")
+        ):
             parts = user_input.split(maxsplit=1)
             _handle_model(parts[1].strip() if len(parts) > 1 else "", provider)
+            continue
+
+        if command == "/provider" or command.startswith("/provider ") or command == "/providers":
+            parts = user_input.split(maxsplit=1)
+            provider = _handle_provider(
+                parts[1].strip() if len(parts) > 1 else "", provider
+            )
             continue
 
         if command.startswith("/"):
             print(f"Unknown command '{user_input}'. Type /help.")
             continue
 
-        _auto_compact(messages, provider)
         print("\nAgent is thinking...")
 
         try:

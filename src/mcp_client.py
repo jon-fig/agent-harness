@@ -34,6 +34,7 @@ from typing import Any
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import get_default_environment, stdio_client
 
+from src import config
 from src.config import (
     MCP_CALL_TIMEOUT,
     MCP_SERVER_ARGS,
@@ -65,6 +66,17 @@ def _describe_exception(exc: BaseException) -> str:
         text = str(current).strip()
         leaves.append(f"{type(current).__name__}: {text}" if text else type(current).__name__)
     return "; ".join(leaves) or type(exc).__name__
+
+
+def _wrap_sandbox(command: str, args: list[str]) -> tuple[str, list[str]]:
+    """Prepends the configured sandbox launcher to the server command.
+
+    The harness cannot confine arbitrary Python by itself, so isolation is
+    delegated to an OS-level launcher (bwrap, firejail, nsjail, container exec).
+    """
+    if not config.MCP_SANDBOX_COMMAND:
+        return command, list(args)
+    return config.MCP_SANDBOX_COMMAND, [*config.MCP_SANDBOX_ARGS, command, *args]
 
 
 def _truncate_middle(text: str, limit: int = TOOL_OUTPUT_MAX_CHARS) -> str:
@@ -290,6 +302,16 @@ class MCPToolBridge:
         return list(self._tools)
 
     @property
+    def is_alive(self) -> bool:
+        """True while the server thread and its MCP session are both up."""
+        return (
+            not self._closed
+            and self._session is not None
+            and self._thread is not None
+            and self._thread.is_alive()
+        )
+
+    @property
     def tool_names(self) -> set[str]:
         return {t.name for t in self._tools}
 
@@ -314,7 +336,13 @@ class MCPToolBridge:
     def call(self, name: str, arguments: dict | None = None) -> str:
         """Calls one MCP tool and returns its result as text."""
         if self._session is None or self._loop is None:
-            raise RuntimeError("MCP bridge is not running. Call start() first.")
+            # Do not leave the process pointing at a dead bridge: clearing the
+            # global lets get_bridge() start a fresh server on the next call.
+            self.close()
+            raise RuntimeError(
+                "MCP server connection was lost. It will be restarted on the next "
+                f"tool call; '{name}' did not run."
+            )
 
         future = asyncio.run_coroutine_threadsafe(
             self._call_tool(name, arguments or {}), self._loop
@@ -329,6 +357,14 @@ class MCPToolBridge:
             raise RuntimeError(
                 f"MCP tool '{name}' did not finish within {self.call_timeout:.0f}s."
             ) from exc
+        except Exception as exc:
+            if not self.is_alive:
+                self.close()
+                raise RuntimeError(
+                    f"MCP server connection was lost during '{name}'. The call may or "
+                    "may not have run; the server will be restarted on the next tool call."
+                ) from exc
+            raise
 
     async def _call_tool(self, name: str, arguments: dict) -> str:
         result = await self._session.call_tool(name, arguments)
@@ -347,10 +383,18 @@ def get_bridge() -> MCPToolBridge:
     global _bridge
 
     with _bridge_lock:
+        if _bridge is not None and not _bridge.is_alive:
+            # The child died or its session dropped: discard it instead of
+            # returning a dead object that would fail every later tool call.
+            try:
+                _bridge.close()
+            finally:
+                _bridge = None
         if _bridge is None:
+            command, args = _wrap_sandbox(MCP_SERVER_COMMAND, MCP_SERVER_ARGS)
             bridge = MCPToolBridge(
-                command=MCP_SERVER_COMMAND,
-                args=MCP_SERVER_ARGS,
+                command=command,
+                args=args,
                 cwd=str(ROOT_DIR),
                 call_timeout=MCP_CALL_TIMEOUT,
                 startup_timeout=MCP_STARTUP_TIMEOUT,
