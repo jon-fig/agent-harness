@@ -184,6 +184,100 @@ class CompactionTestCase(unittest.TestCase):
                 arguments = message["tool_calls"][0]["function"]["arguments"]
                 self.assertIn("chars collapsed", arguments)
 
+    # --- improved compaction ------------------------------------------------
+
+    def test_summary_level_keeps_the_first_line_of_a_result(self):
+        messages = conversation(turns=2, output_chars=8_000, code_chars=10)
+        compacted = budget.compact_history(
+            messages, keep_exchanges=1, detail=budget.DETAIL_SUMMARY
+        )
+        collapsed = compacted[2]["content"]
+        self.assertTrue(collapsed.startswith("run_python_code(...) -> ok ("))
+        self.assertIn("first line: result", collapsed)
+        # The newest exchange stays verbatim at this level too.
+        self.assertEqual(compacted[5], messages[5])
+
+    def test_automatic_compaction_prefers_the_informative_summary(self):
+        messages = conversation(turns=2, output_chars=40_000)
+        result = compact(messages, limit=40_000, threshold=0.2, target=0.4)
+        self.assertTrue(result.changed)
+        self.assertTrue(result.reached_target)
+        tool_texts = [
+            message["content"]
+            for message in result.messages
+            if message.get("role") == "tool"
+        ]
+        self.assertTrue(any("first line:" in text for text in tool_texts))
+
+    def test_error_results_are_preserved(self):
+        messages = [
+            {"role": "user", "content": "Fix the script"},
+            *exchange(
+                "call_1",
+                "print(1)" * 400,
+                "Error: File 'data.csv' not found. Available: a.csv, b.csv",
+            ),
+            {"role": "user", "content": "Try again"},
+            *exchange("call_2", "print(2)", "ok"),
+        ]
+        compacted = budget.compact_history(messages, keep_exchanges=1)
+        error_text = compacted[2]["content"]
+        self.assertTrue(error_text.startswith("Error"))
+        self.assertIn("data.csv", error_text)
+
+    def test_original_requirements_survive_many_compactions(self):
+        messages = conversation(turns=4, output_chars=8_000, code_chars=500)
+        requirement = "Original requirement: clean both CSV files."
+        messages.insert(0, {"role": "user", "content": requirement})
+        result = compact(messages, limit=12_000, threshold=0.0001, target=0.0001)
+        self.assertTrue(result.changed)
+        self.assertEqual(result.messages[0]["content"], requirement)
+
+    def test_repeated_compaction_is_idempotent(self):
+        messages = conversation(turns=3, output_chars=8_000)
+        first = budget.compact_history(
+            messages, keep_exchanges=1, detail=budget.DETAIL_SUMMARY
+        )
+        second = budget.compact_history(
+            first, keep_exchanges=1, detail=budget.DETAIL_SUMMARY
+        )
+        # Already-collapsed results are never rewritten as "ok (0.0 KB)".
+        self.assertEqual(second, first)
+
+        result = compact(first, limit=10_000, threshold=0.0001, target=0.0001)
+        self.assertFalse(result.changed)
+        self.assertIn("no stale", result.reason)
+
+    def test_accounting_reports_before_after_saved_and_percentage(self):
+        messages = conversation(turns=2, output_chars=8_000)
+        before = budget.measure_request(
+            SYSTEM, messages, [], request_budget(20_000), compact=False
+        ).tokens
+        result = compact(messages, limit=20_000, threshold=0.0001, target=0.0001)
+        self.assertTrue(result.changed)
+        self.assertEqual(result.before_tokens, before)
+        self.assertEqual(result.reduction, before - result.after_tokens)
+        self.assertGreater(result.reduction, 0)
+        self.assertGreater(result.percent_reduction, 0)
+        self.assertLessEqual(result.percent_reduction, 100)
+
+    def test_unreachable_target_reports_the_protected_floor(self):
+        big = "result\n" * 2_000
+        messages = [
+            {"role": "user", "content": "Requirements: " + "x" * 40_000},
+            *exchange("call_1", "print(1)", big),
+            {"role": "user", "content": "continue"},
+            *exchange("call_2", "print(2)", big),
+        ]
+        result = compact(messages, limit=20_000, threshold=0.0001, target=0.01)
+        self.assertTrue(result.changed)
+        self.assertFalse(result.reached_target)
+        self.assertGreater(result.after_tokens, result.target_tokens)
+        self.assertGreaterEqual(result.floor_tokens, result.after_tokens)
+        self.assertIn("protected", result.reason)
+        # The user's requirements are still there in full.
+        self.assertEqual(result.messages[0]["content"], messages[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

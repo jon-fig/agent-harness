@@ -4,10 +4,14 @@ python-dotenv>=1.0.0
 # Exact token counts for the input budget (falls back to chars/4 if absent).
 tiktoken>=0.7.0
 
-# MCP client used by src/mcp_client.py to talk to the tool server over stdio.
-mcp>=2.0.0,<3
-
-# The MCP server keeps its own dependency set (it requires mcp<2), so it lives in a
-# separate virtualenv instead of in this file:
-#   python -m venv .venv-mcp
-#   .venv-mcp/Scripts/python.exe -m pip install "mcp<2" mcp-python-interpreter
+# MCP client (src/mcp_client.py) and the tool server, installed into the *same*
+# virtual environment as the harness so the interpreter that runs the agent, the
+# server executable, the interpreter used by run_python_code / run_python_file and
+# the pip target are one environment.
+#
+# mcp must stay <2: mcp-python-interpreter imports mcp.server.fastmcp, which mcp
+# 2.x replaced with mcp.server.mcpserver (the 2.x module raises
+# ModuleNotFoundError and says so). These are the exact versions this dependency
+# set was verified against; do not loosen them without re-running the suite.
+mcp==1.30.0
+mcp-python-interpreter==1.2.3

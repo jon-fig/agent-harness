@@ -63,26 +63,90 @@ AI_BASE_URL = os.getenv("AI_BASE_URL") or os.getenv("LLM_BASE_URL") or ""
 AI_MODEL = os.getenv("AI_MODEL") or ""
 
 # ----------------------------------------------------------------- Tool backend
-# Every file/execution tool is served by an MCP server over stdio. The only
-# in-process tool is save_memory (harness state), implemented in src/memory.py.
+# Every file/execution tool is served by an MCP server over stdio. The two
+# in-process tools are save_memory (harness state) and python_environment_info.
+#
+# One virtual environment serves the whole agent. The server is a console script
+# installed next to the interpreter that runs the harness, so the harness
+# interpreter, the server executable, the interpreter used by run_python_code /
+# run_python_file, the pip target and the package query all name the same
+# environment (`.venv` by default). That is what keeps `import pandas` from
+# succeeding in one tool and failing in another.
+#
+# It must be launched through its console script: the package has no __main__, so
+# `python -m mcp_python_interpreter` is not supported upstream.
+SERVER_SCRIPT_NAME = "mcp-python-interpreter"
+# The interpreter the tools execute code with, and the one pip installs into.
+MCP_PYTHON = sys.executable
+# Virtualenv layout: Scripts\ on Windows, bin/ everywhere else.
+BIN_DIR_NAME = "Scripts" if os.name == "nt" else "bin"
 
-# The MCP server ships its own dependency set (it needs mcp<2), so it may live in a
-# dedicated virtualenv. It must be launched through its console script: the package
-# has no __main__, so `python -m mcp_python_interpreter` is not supported upstream.
-_SERVER_VENV_BIN = (
-    ROOT_DIR / ".venv-mcp" / "Scripts",  # Windows
-    ROOT_DIR / ".venv-mcp" / "bin",      # POSIX
-)
-_SERVER_SCRIPT = "mcp-python-interpreter.exe" if os.name == "nt" else "mcp-python-interpreter"
-_DEFAULT_SERVER_COMMAND = next(
-    (str(d / _SERVER_SCRIPT) for d in _SERVER_VENV_BIN if (d / _SERVER_SCRIPT).exists()),
-    _SERVER_SCRIPT,
-)
 
-MCP_SERVER_COMMAND = os.getenv("MCP_SERVER_COMMAND", _DEFAULT_SERVER_COMMAND)
+def environment_bin_dir(prefix: str | os.PathLike[str]) -> Path:
+    """The script directory of a virtual environment on this platform."""
+    return Path(prefix) / BIN_DIR_NAME
+
+
+def project_python() -> Path:
+    """The interpreter of the project's documented ``.venv`` on this platform."""
+    name = "python.exe" if os.name == "nt" else "python"
+    return environment_bin_dir(ROOT_DIR / ".venv") / name
+
+
+def interpreter_problem() -> str | None:
+    """Explains why this interpreter cannot serve the harness, or returns None.
+
+    The harness and the MCP server must share one virtual environment. A system
+    interpreter would load the client from one site-packages while the server and
+    the code tools used another, which is the mismatch the unified setup exists to
+    prevent, so it is refused instead of silently repaired from ``PATH`` or from a
+    different checkout's ``.venv``.
+    """
+    if sys.prefix != sys.base_prefix:
+        return None
+    return (
+        "the harness is not running inside a virtual environment "
+        f"(interpreter: {sys.executable}, prefix: {sys.prefix}). "
+        "Start it with the environment that has requirements.txt installed: "
+        f"\"{project_python()}\" -m src.main"
+    )
+
+
+def require_supported_interpreter() -> None:
+    """Raises a clear error when the harness was started from a global Python."""
+    problem = interpreter_problem()
+    if problem:
+        raise RuntimeError(problem)
+
+
+def mcp_server_candidates() -> list[Path]:
+    """The console-script path inside the active environment.
+
+    Only ``sys.prefix`` is considered. Falling back to the project's ``.venv``
+    used to launch a server from one environment while ``--python-path`` named
+    another interpreter; if the active environment lacks the server, the bridge
+    now says how to install it instead of starting a mismatched one.
+
+    A bare command name is deliberately never used: resolving through PATH would
+    launch a globally installed server whose site-packages differ from the ones
+    run_python_code imports from.
+    """
+    name = f"{SERVER_SCRIPT_NAME}.exe" if os.name == "nt" else SERVER_SCRIPT_NAME
+    return [environment_bin_dir(sys.prefix) / name]
+
+
+def resolve_mcp_server_command() -> str:
+    """The server executable inside an existing environment, or "" if none."""
+    for candidate in mcp_server_candidates():
+        if candidate.is_file():
+            return str(candidate)
+    return ""
+
+
+MCP_SERVER_COMMAND = os.getenv("MCP_SERVER_COMMAND") or resolve_mcp_server_command()
 MCP_SERVER_ARGS = json.loads(os.getenv("MCP_SERVER_ARGS", "null")) or [
     "--dir", str(WORKSPACE_DIR),
-    "--python-path", sys.executable,
+    "--python-path", MCP_PYTHON,
 ]
 MCP_CALL_TIMEOUT = float(os.getenv("MCP_CALL_TIMEOUT", "300"))
 MCP_STARTUP_TIMEOUT = float(os.getenv("MCP_STARTUP_TIMEOUT", "60"))
@@ -90,13 +154,21 @@ MCP_STARTUP_TIMEOUT = float(os.getenv("MCP_STARTUP_TIMEOUT", "60"))
 # server command, so bwrap/firejail/nsjail/container-exec can confine the tools.
 MCP_SANDBOX_COMMAND = os.getenv("MCP_SANDBOX_COMMAND", "").strip()
 MCP_SANDBOX_ARGS = json.loads(os.getenv("MCP_SANDBOX_ARGS") or "null") or []
+# Package installation mutates the environment, so the harness itself asks before
+# it runs: "ask" prompts on the terminal that started the agent, "deny" refuses
+# every request. The model cannot approve its own install by writing about it.
+MCP_INSTALL_APPROVAL = os.getenv("MCP_INSTALL_APPROVAL", "ask").strip().lower() or "ask"
+
+# NOTE: every value in this module is read once, when the harness starts. Editing
+# .env while the agent is running has no effect until it is restarted (the REPL's
+# /provider and /model commands change the connection, not these limits).
 
 # ------------------------------------------------------- Token budget / LLM
 # Groq's free tier for openai/gpt-oss-120b is ~8K tokens per rolling minute,
 # counting input AND output. A request whose input does not fit is rejected with
 # 413; a drained window throttles the rest with 429. These caps exist so a whole
 # coding turn stays inside one bucket.
-MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "5"))
+MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "8"))
 # MAX_ITERATIONS bounds model calls; one response can request many tool calls, so
 # executions get their own per-turn ceiling.
 MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "20"))
@@ -109,7 +181,10 @@ DEDUPE_TOOL_CALLS = os.getenv("DEDUPE_TOOL_CALLS", "0").strip().lower() in (
     "yes",
     "on",
 )
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "1200"))
+# The generation limit asked of the model. It is a *token* request and is clamped
+# per model/provider by src/models.py (context window, TPM bucket), so a generic
+# 4000 never overrides a lower model-specific maximum.
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "4000"))
 MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "6500"))
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "120"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
@@ -118,8 +193,10 @@ LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 MODEL_DISCOVERY_TIMEOUT = float(os.getenv("MODEL_DISCOVERY_TIMEOUT", "20"))
 
 # Enforced before a request is built: one tool result, the memory block, and how
-# many recent tool exchanges are replayed verbatim.
-TOOL_OUTPUT_MAX_CHARS = int(os.getenv("TOOL_OUTPUT_MAX_CHARS", "1600"))
+# many recent tool exchanges are replayed verbatim. TOOL_OUTPUT_MAX_CHARS is a
+# *character* cap applied where tool output enters history; it is not a token
+# limit and does not have to equal MAX_OUTPUT_TOKENS.
+TOOL_OUTPUT_MAX_CHARS = int(os.getenv("TOOL_OUTPUT_MAX_CHARS", "4000"))
 MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "1200"))
 HISTORY_KEEP_EXCHANGES = int(os.getenv("HISTORY_KEEP_EXCHANGES", "2"))
 # Auto-compaction is evaluated by the agent against the complete request (system

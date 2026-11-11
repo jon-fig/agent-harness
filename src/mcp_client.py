@@ -40,8 +40,8 @@ from src.config import (
     MCP_SERVER_ARGS,
     MCP_SERVER_COMMAND,
     MCP_STARTUP_TIMEOUT,
-    ROOT_DIR,
     TOOL_OUTPUT_MAX_CHARS,
+    WORKSPACE_DIR,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +79,18 @@ def _wrap_sandbox(command: str, args: list[str]) -> tuple[str, list[str]]:
     return config.MCP_SANDBOX_COMMAND, [*config.MCP_SANDBOX_ARGS, command, *args]
 
 
+def _is_json_document(text: str) -> bool:
+    """True when the whole output is one parseable JSON value."""
+    stripped = text.lstrip()
+    if not stripped or stripped[0] not in "[{":
+        return False
+    try:
+        json.loads(stripped)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _truncate_middle(text: str, limit: int = TOOL_OUTPUT_MAX_CHARS) -> str:
     """Caps one tool result while keeping both ends.
 
@@ -86,6 +98,9 @@ def _truncate_middle(text: str, limit: int = TOOL_OUTPUT_MAX_CHARS) -> str:
     the traceback or the last rows, so the middle is what gets dropped. This is
     the single point where tool output enters the chat history, which makes it the
     only place a 20 KB CSV read can be stopped from eating a whole turn.
+
+    A JSON document is marked explicitly: cutting its middle leaves invalid JSON,
+    and the model must not mistake the fragment for a complete, parseable result.
     """
     if len(text) <= limit:
         return text
@@ -93,7 +108,15 @@ def _truncate_middle(text: str, limit: int = TOOL_OUTPUT_MAX_CHARS) -> str:
     head = (limit * 2) // 3
     tail = limit - head
     omitted = len(text) - head - tail
-    return f"{text[:head]}\n…[ {omitted} chars omitted ]…\n{text[-tail:]}"
+    if _is_json_document(text):
+        notice = (
+            f"[Truncated JSON tool output: {len(text)} characters total, "
+            f"{omitted} chars omitted. The middle was removed, so this is "
+            "NOT valid JSON; request a smaller result instead.]"
+        )
+    else:
+        notice = f"…[ {omitted} chars omitted; output truncated ]…"
+    return f"{text[:head]}\n{notice}\n{text[-tail:]}"
 
 
 def _format_result(result: Any) -> str:
@@ -159,14 +182,22 @@ class MCPToolBridge:
         if self._thread is not None:
             return self
 
-        # A mistyped MCP_SERVER_COMMAND, or a clone that never created the server
-        # venv, otherwise surfaces as an opaque TaskGroup error from the client.
+        # A mistyped MCP_SERVER_COMMAND, or a clone that never installed the
+        # server, otherwise surfaces as an opaque TaskGroup error from the client.
+        if not self.command:
+            looked_in = ", ".join(str(path) for path in config.mcp_server_candidates())
+            raise RuntimeError(
+                "MCP server executable not found. It is installed with the harness, so "
+                f"use the interpreter that runs the agent ({config.MCP_PYTHON}): "
+                f"\"{config.MCP_PYTHON}\" -m pip install -r requirements.txt "
+                f"(looked in: {looked_in}). Or set MCP_SERVER_COMMAND explicitly."
+            )
         if not os.path.exists(self.command) and shutil.which(self.command) is None:
             raise RuntimeError(
-                f"MCP server executable not found: {self.command}. Create the server venv: "
-                "python -m venv .venv-mcp && "
-                ".venv-mcp/Scripts/python.exe -m pip install 'mcp<2' mcp-python-interpreter "
-                "(or point MCP_SERVER_COMMAND at an existing install)."
+                f"MCP server executable not found: {self.command}. Install it into the "
+                f"environment that runs the harness ({config.MCP_PYTHON}): "
+                f"\"{config.MCP_PYTHON}\" -m pip install -r requirements.txt, or point "
+                "MCP_SERVER_COMMAND at an existing install."
             )
 
         self._thread = threading.Thread(target=self._run_loop, name="mcp-bridge", daemon=True)
@@ -391,11 +422,18 @@ def get_bridge() -> MCPToolBridge:
             finally:
                 _bridge = None
         if _bridge is None:
+            # Starting the server from a global interpreter would put the client
+            # and the code-execution environment in different site-packages.
+            config.require_supported_interpreter()
             command, args = _wrap_sandbox(MCP_SERVER_COMMAND, MCP_SERVER_ARGS)
             bridge = MCPToolBridge(
                 command=command,
                 args=args,
-                cwd=str(ROOT_DIR),
+                # The server's working directory is the workspace: run_python_code
+                # runs in-process there, and run_python_file already executes with
+                # cwd=workspace. Starting the child in the repo root instead made a
+                # bare "data.csv" resolve differently in the two tools.
+                cwd=str(WORKSPACE_DIR),
                 call_timeout=MCP_CALL_TIMEOUT,
                 startup_timeout=MCP_STARTUP_TIMEOUT,
             )

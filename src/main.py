@@ -12,11 +12,28 @@ real catalogue over GET /models.
 
 import argparse
 
+# CPython enables line editing for input() only when the readline module is
+# imported, and it does that automatically only for the interactive REPL. A
+# module run ("python -m src.main") starts without it, so arrow keys, Home/End,
+# Ctrl+A/E and backspace across wrapped lines are echoed as raw escape
+# sequences and never reach the prompt. POSIX: import it explicitly. Windows:
+# the console host already provides its own editing, and the missing module is
+# ignored so native behavior is preserved.
+try:
+    import readline  # noqa: F401
+except ImportError:  # pragma: no cover - Windows console editing stays native
+    pass
+
 from src import config, models, providers, usage
 from src.agent import AgentError, run_agent
 from src.budget import compact_history, estimate_tokens
 from src.llm_client import list_models
-from src.session import clear_session_file, load_session, save_session
+from src.session import (
+    clear_session_file,
+    load_session,
+    save_session,
+    set_session_enabled,
+)
 
 HELP = """Commands:
   /model            show the active model, provider and bundled options
@@ -24,10 +41,10 @@ HELP = """Commands:
   /model <id|#>     switch model (id, alias, or a number from /model list)
   /provider         show the active provider and the other configured ones
   /provider <name>  switch provider for this session
-  /clear            forget the conversation (and delete the saved session)
+  /clear            forget the conversation (and delete the saved session unless --no-session)
   /compact          collapse older tool exchanges now, keeping the latest ones verbatim
   /help             show this help
-  exit              quit (history is saved automatically)"""
+  exit              quit (history is saved unless --no-session was given)"""
 
 # Model ids fetched during this session, used to resolve "/model 7".
 _MODEL_CACHE: dict[str, list[str]] = {}
@@ -167,7 +184,11 @@ def main():
             "perplexity, ollama, or any custom name)"
         ),
     )
-    parser.add_argument("--no-session", action="store_true", help="start from an empty history")
+    parser.add_argument(
+        "--no-session",
+        action="store_true",
+        help="start from an empty history and do not load or save the session file",
+    )
     parser.add_argument(
         "--model",
         help="model id or alias for this provider for this and later runs (overrides .env)",
@@ -183,6 +204,15 @@ def main():
         help="print the providers configured in this environment and exit",
     )
     args = parser.parse_args()
+
+    # Disable both directions of persistence before anything can touch the file:
+    # history loading below, and the save/clear paths in the REPL and at exit.
+    set_session_enabled(not args.no_session)
+
+    try:
+        config.require_supported_interpreter()
+    except RuntimeError as exc:
+        raise SystemExit(f"[Environment Error] {exc}")
 
     if args.debug_tokens:
         config.DEBUG_TOKENS = True

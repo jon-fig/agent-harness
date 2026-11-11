@@ -22,7 +22,7 @@ venv/
 .agent/
 
 # --- Workspace Runtime Files (Optional: ignore agent output files if needed) ---
-# !workspace/.gitkeep
+workspace/
 
 # --- IDE / VS Code ---
 .history/
@@ -31,3 +31,6 @@ venv/
 # --- OS Generated Files ---
 .DS_Store
 Thumbs.db
+
+# --- Ignore AI agent instruction files
+AGENTS.md 

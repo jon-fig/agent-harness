@@ -229,6 +229,14 @@ def _rate_limit(env_name: str, fallback: int | None) -> int | None:
     return fallback if value is None else value
 
 
+# A request is input + reserved output. Both share the context window, and on a
+# metered provider both share the per-minute token bucket, so the input ceiling is
+# never allowed to eat the whole allowance: at least this much prompt room is kept,
+# and a small safety margin covers the provider's own accounting.
+MIN_REQUEST_INPUT_TOKENS = 400
+RATE_LIMIT_HEADROOM = 200
+
+
 def request_budget(model_id: str, provider: str | None = None) -> RequestBudget:
     """Builds the size and rate budget for one provider/model pair.
 
@@ -284,17 +292,31 @@ def request_budget(model_id: str, provider: str | None = None) -> RequestBudget:
             config.OLLAMA_MAX_INPUT_TOKENS if local else config.MAX_INPUT_TOKENS
         )
 
+    # A generic MAX_OUTPUT_TOKENS is a request, not a guarantee: clamp it to what
+    # this model/provider can actually emit. Without this, raising the default to
+    # 4000 would reserve more than a 2000-TPM bucket (leaving a 400-token input
+    # budget and an output request the provider must reject) and would silently
+    # override a lower model-specific or provider-specific maximum.
+    output_ceiling: int | None = None
+    if context is not None:
+        output_ceiling = context - MIN_REQUEST_INPUT_TOKENS
+    if rate_limits.tpm is not None:
+        tpm_output = rate_limits.tpm - MIN_REQUEST_INPUT_TOKENS - RATE_LIMIT_HEADROOM
+        output_ceiling = tpm_output if output_ceiling is None else min(output_ceiling, tpm_output)
+    if output_ceiling is not None:
+        max_output = max(1, min(max_output, output_ceiling))
+
     # The request's input and its reserved output share the context window, and
     # on a metered provider they also share the per-minute token bucket.
     ceiling: int | None = None
     if context is not None:
         ceiling = context - max_output
     if rate_limits.tpm is not None:
-        tpm_room = rate_limits.tpm - max_output - 200
+        tpm_room = rate_limits.tpm - max_output - RATE_LIMIT_HEADROOM
         ceiling = tpm_room if ceiling is None else min(ceiling, tpm_room)
 
     max_input = configured_input if ceiling is None else min(configured_input, ceiling)
-    max_input = max(400, max_input)
+    max_input = max(MIN_REQUEST_INPUT_TOKENS, max_input)
 
     if spec is not None:
         source = "bundled"

@@ -96,6 +96,40 @@ class BudgetTestCase(unittest.TestCase):
         self.assertEqual(budget.source, "local")
         self.assertFalse(budget.rate_limits.any)
 
+    # --- the larger generic output default ----------------------------------
+
+    def test_generic_output_default_is_clamped_by_the_minute_bucket(self):
+        with mock.patch.object(config, "MAX_OUTPUT_TOKENS", 4000):
+            budget = models.request_budget("openai/gpt-oss-120b", "groq")
+            self.assertEqual(budget.max_output_tokens, 4000)
+            # 8K TPM cannot hold a 6.5K input and a 4K output together.
+            self.assertEqual(budget.max_input_tokens, 8000 - 4000 - 200)
+
+            cheap = models.request_budget("openai/gpt-oss-safeguard-20b", "groq")
+            self.assertEqual(cheap.max_output_tokens, 2000 - 400 - 200)
+            self.assertEqual(cheap.max_input_tokens, 400)
+            self.assertLessEqual(
+                cheap.max_input_tokens + cheap.max_output_tokens, 2000
+            )
+
+    def test_generic_output_default_is_clamped_by_the_context_window(self):
+        os.environ["NVIDIA_CONTEXT_WINDOW"] = "2000"
+        with mock.patch.object(config, "MAX_OUTPUT_TOKENS", 4000):
+            budget = models.request_budget("some/model", "nvidia")
+        self.assertEqual(budget.max_output_tokens, 2000 - 400)
+        self.assertEqual(budget.max_input_tokens, 400)
+
+    def test_model_specific_output_limit_beats_the_generic_default(self):
+        os.environ["NVIDIA_MAX_OUTPUT_TOKENS"] = "1024"
+        with mock.patch.object(config, "MAX_OUTPUT_TOKENS", 4000):
+            budget = models.request_budget("some/model", "nvidia")
+        self.assertEqual(budget.max_output_tokens, 1024)
+
+    def test_input_plus_reserved_output_fits_the_bucket(self):
+        with mock.patch.object(config, "MAX_OUTPUT_TOKENS", 4000):
+            budget = models.request_budget("openai/gpt-oss-120b", "groq")
+        self.assertLessEqual(budget.max_input_tokens + budget.max_output_tokens, 8000)
+
 
 if __name__ == "__main__":
     unittest.main()

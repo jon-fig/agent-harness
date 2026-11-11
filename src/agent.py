@@ -22,8 +22,9 @@ import re
 import time
 import types
 import uuid
+from pathlib import Path
 
-from src import config, models, providers, tokenization, usage
+from src import config, environment, models, providers, tokenization, usage
 from src.budget import build_payload, compact_history, maybe_auto_compact
 from src.config import LLM_MAX_RETRIES, MEMORY_MAX_CHARS
 from src.llm_client import get_llm_client
@@ -45,14 +46,28 @@ HARNESS_TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "python_environment_info",
+            "description": (
+                "Report the interpreter, virtualenv, workspace directory and installed "
+                "packages used by the Python tools. Call this before guessing why an import fails."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
-HARNESS_TOOL_MAP = {"save_memory": save_memory}
+HARNESS_TOOL_MAP = {
+    "save_memory": save_memory,
+    "python_environment_info": environment.python_environment_info,
+}
 
-# Stage 1: only the tools a coding turn actually needs. install_package is the
-# only tool that can mutate the server's venv, and the environment/package/session
-# listing helpers are diagnostics the loop never needs. clear_session stays: it is
-# the only way to reset the persistent default REPL session, and the harness calls
-# it at the start of every turn.
+# Stage 1: the tools a coding turn needs, plus the diagnostics that stop a turn
+# from being spent guessing where code runs. install_package is exposed again now
+# that one environment serves the whole agent, but dispatch() intercepts it: the
+# harness asks the user before anything is installed. Deliberately hidden:
+# list_sessions and the unused input helpers of the server.
 KEEP_TOOLS = {
     "read_file",
     "write_file",
@@ -60,26 +75,36 @@ KEEP_TOOLS = {
     "run_python_code",
     "run_python_file",
     "clear_session",
+    "list_installed_packages",
+    "list_python_environments",
+    "install_package",
 }
 
 # Stage 2: presentation-only short descriptions. The server remains the source of
 # truth for names, types and required arguments; this map only replaces prose that
 # would otherwise be resent on every request (run_python_code's is 825 chars).
+# Each one names the interpreter or directory the tool actually uses, because
+# "which environment?" was the expensive question in practice.
 SHORT_DESCRIPTIONS = {
-    "read_file": "Read a text file (never a CSV) from the workspace.",
-    "write_file": "Write a file in the workspace; overwrite to replace.",
-    "list_directory": "List files in a workspace directory.",
-    "run_python_code": "Run Python inline; print only what you need to see.",
-    "run_python_file": "Run a workspace .py file and return its output.",
+    "read_file": "Read a text file (never a CSV); paths are workspace-relative.",
+    "write_file": "Write a workspace file; overwrite to replace.",
+    "list_directory": "List a workspace directory (empty means the workspace root).",
+    "run_python_code": "Run inline Python in the agent venv; relative paths start at the workspace.",
+    "run_python_file": "Run a .py file from the workspace with the agent venv interpreter.",
     "clear_session": "Reset the Python session and its variables.",
+    "list_installed_packages": "List packages installed in the venv that runs agent code.",
+    "list_python_environments": "List the Python interpreters the tool server can use.",
+    "install_package": "Install a package into the agent venv; the user must approve it.",
 }
 MAX_DESCRIPTION_CHARS = 90
 
 # Stage 3: role, sandbox scope, and the two rules that prevent token blowups.
 SYSTEM_PROMPT = """You are an autonomous coding and data-science agent working in a sandboxed workspace served by MCP tools.
+Tool paths are relative to the workspace root; run_python_code and run_python_file run in the same virtualenv, and Python code starts in the workspace directory.
 Use read_file / list_directory for text files; use run_python_code or run_python_file for anything involving datasets.
 Never read_file a CSV or other dataset: inspect it with pandas and print only what you need.
 After write_file, do not read the file back to verify; run it instead.
+If an import fails, call python_environment_info or list_installed_packages before retrying; install_package asks the user first, so say why the package is needed.
 Issue independent tool calls together in one response.
 Reply with a short summary of what you did and what is left."""
 
@@ -95,6 +120,40 @@ Summarise what you completed, what is left, and which files hold the result."""
 # conversation has not changed, so the tool cannot return anything new. The head
 # of the earlier result is enough for the model to continue.
 DUPLICATE_HEAD_CHARS = 400
+
+# --- Text tool-call protocols ------------------------------------------------
+# Some providers return a tool call as ordinary text instead of the native
+# tool_calls field. NVIDIA NIM serving MiniMax additionally degrades the model's
+# tool-call special tokens into literal text, so its XML-ish serialization
+# arrives with a noise string in front of every structural tag:
+#
+#   NOISE TOOL_OPEN \n NOISE <invoke name="read_file"> NOISE <file_path>...
+#
+# The tag strings below are assembled from chr() pieces so this file never
+# contains the raw sequences: the same sequences are what other tool-call
+# parsers scan for, which is the leakage being fixed here.
+_MINIMAX_TOKEN_NOISE = "]<]minimax[>["
+
+
+def _tag(name: str) -> str:
+    """Builds an XML tag string without writing angle-bracket literals."""
+    return f"{chr(60)}{name}{chr(62)}"
+
+
+_MINIMAX_OPEN = _tag("tool_call")
+_MINIMAX_CLOSE = _tag("/tool_call")
+# <invoke name="..."> ... </invoke>, one or more per tool_call block.
+_MINIMAX_INVOKE_RE = re.compile(
+    chr(60) + r'invoke\s+name="([^"]*)"' + chr(62) + r"(.*?)" + chr(60) + r"/invoke",
+    re.DOTALL,
+)
+# An opening <invoke that never found its </invoke>.
+_MINIMAX_INVOKE_START_RE = re.compile(chr(60) + r"invoke\b")
+# <param>value</param> inside one invoke.
+_MINIMAX_PARAM_RE = re.compile(
+    chr(60) + r"([A-Za-z_][\w-]*)" + chr(62) + r"(.*?)" + chr(60) + r"/\1" + chr(62),
+    re.DOTALL,
+)
 
 
 class BudgetExceeded(RuntimeError):
@@ -238,8 +297,17 @@ def get_tooling():
             if backup_current():
                 print("[Agent Info] Backed up memory.md to .agent/memory.bak before overwriting.")
 
+        if name == "install_package":
+            # Never a pass-through: validation, the global-interpreter refusal, the
+            # user's approval and the post-install import check all happen inside.
+            # The model asking in prose does not install anything.
+            return environment.install_package(arguments)
         if name in HARNESS_TOOL_MAP:
             return HARNESS_TOOL_MAP[name](**arguments)
+
+        missing = _missing_path_error(name, arguments)
+        if missing:
+            return missing
         # Resolved per call so a bridge that died mid-turn is replaced instead of
         # failing every later tool call in the turn.
         return get_bridge().call(name, arguments)
@@ -288,6 +356,84 @@ def _touches_memory(arguments: dict) -> bool:
     return False
 
 
+# Tools whose path argument must already exist. write_file is absent on purpose:
+# it creates the file, so a missing path is the normal case.
+_PATH_ARGUMENTS = {
+    "read_file": "file_path",
+    "run_python_file": "file_path",
+    "list_directory": "directory_path",
+}
+
+
+def _workspace_listing(limit: int = 25) -> str:
+    """Names of the workspace entries, for a "that file does not exist" answer."""
+    try:
+        entries = sorted(
+            entry.name + ("/" if entry.is_dir() else "")
+            for entry in config.WORKSPACE_DIR.iterdir()
+        )
+    except OSError:
+        return ""
+    if not entries:
+        return "(empty)"
+    shown = ", ".join(entries[:limit])
+    if len(entries) > limit:
+        shown += f", … {len(entries) - limit} more"
+    return shown
+
+
+def _missing_path_error(name: str, arguments: dict) -> str | None:
+    """Answers a missing workspace path with the workspace and what is in it.
+
+    The server replies "File 'x' not found" without saying where it looked, so a
+    turn used to be spent retrying guessed absolute paths. Absolute paths are left
+    to the server, which owns the access check.
+    """
+    key = _PATH_ARGUMENTS.get(name)
+    if key is None:
+        return None
+    raw = arguments.get(key)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    path = Path(raw)
+    if path.is_absolute():
+        return None
+
+    try:
+        workspace = config.WORKSPACE_DIR.resolve()
+    except OSError:
+        return None
+    target = (workspace / path).resolve()
+    if target.exists():
+        return None
+    if target != workspace and workspace not in target.parents:
+        return (
+            f"Error: '{raw}' resolves outside the workspace ({workspace}). "
+            "Use a path relative to the workspace root."
+        )
+
+    # List the nearest existing directory: for "out/notes.md" that is "out/",
+    # which is usually what the caller meant to look at.
+    parent = target.parent
+    while not parent.exists() and parent != workspace:
+        parent = parent.parent
+    listing = _workspace_listing()
+    if parent != workspace:
+        try:
+            names = sorted(
+                entry.name + ("/" if entry.is_dir() else "") for entry in parent.iterdir()
+            )
+            listing = ", ".join(names[:25]) or "(empty)"
+        except OSError:
+            pass
+
+    kind = "directory" if name == "list_directory" else "file"
+    return (
+        f"Error: {kind} '{raw}' does not exist in the workspace ({workspace}). "
+        f"Paths are relative to the workspace root; available: {listing or '(empty)'}."
+    )
+
+
 def _validate_arguments(name: str, parameters: dict | None, arguments: dict) -> str | None:
     """Checks a call against the tool's advertised schema, cheaply.
 
@@ -302,8 +448,14 @@ def _validate_arguments(name: str, parameters: dict | None, arguments: dict) -> 
     parameters = parameters if isinstance(parameters, dict) else {}
     properties = parameters.get("properties")
     required = parameters.get("required") or []
+    # An empty properties object declares nothing: the MCP server advertises
+    # every tool with {"properties": {}, "required": []}, so treating that as a
+    # closed set would reject even the arguments the server itself expects
+    # ("does not accept argument(s) 'file_path'. Allowed: (none)."). The server
+    # owns the real schema and reports missing or unknown fields itself.
+    declares_arguments = bool(properties)
     strict = (
-        isinstance(properties, dict)
+        declares_arguments
         and parameters.get("additionalProperties") in (None, False)
         and not parameters.get("$ref")
         and not parameters.get("oneOf")
@@ -436,6 +588,61 @@ def _parse_text_tool_call(content: str) -> tuple[str, str] | None:
     else:
         return None
     return name.strip(), arguments_json
+
+
+def _decode_minimax_param(value: str):
+    """Converts one MiniMax parameter from text to its JSON value.
+
+    Only unambiguous JSON values (objects, arrays, true/false/null) are
+    converted; numbers stay strings so a numeric-looking file path is not
+    silently retyped. Wrong types surface through the schema validation, which
+    the model can read and correct.
+    """
+    text = value.strip()
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return value
+    if isinstance(parsed, (dict, list, bool)) or parsed is None:
+        return parsed
+    return value
+
+
+def _parse_minimax_tool_calls(content: str) -> list[tuple[str, str]] | None:
+    """Reads the tool calls a MiniMax response serialized as text.
+
+    Returns None when the text contains no MiniMax tool-call serialization at
+    all, so ordinary prose (even prose that mentions the format) is never
+    rewritten. Returns a list of (tool name, arguments JSON) pairs, which is
+    empty when serialization is present but no complete call could be read:
+    a truncated or malformed call must not be executed.
+    """
+    if _MINIMAX_TOKEN_NOISE not in content and _MINIMAX_OPEN not in content:
+        return None
+
+    cleaned = content.replace(_MINIMAX_TOKEN_NOISE, "")
+    calls: list[tuple[str, str]] = []
+    for name, body in _MINIMAX_INVOKE_RE.findall(cleaned):
+        arguments: dict = {}
+        for tag, value in _MINIMAX_PARAM_RE.findall(body):
+            arguments[tag] = _decode_minimax_param(value)
+        if name.strip():
+            calls.append((name.strip(), json.dumps(arguments)))
+
+    if not calls and not (
+        _MINIMAX_INVOKE_START_RE.search(cleaned)
+        or _MINIMAX_OPEN in cleaned
+        or _MINIMAX_CLOSE in cleaned
+        # A degraded tag whose name was mangled still starts with a bracket
+        # right after the noise, e.g. the open tag reduced to a bare word.
+        # Checked against the original text: the noise is stripped from
+        # `cleaned` above, so the adjacency can only be seen there.
+        or (_MINIMAX_TOKEN_NOISE + chr(60)) in content
+    ):
+        # The degraded special tokens appeared in ordinary prose, with no
+        # attempt at a tool call. Nothing to do and nothing to strip.
+        return None
+    return calls
 
 
 def _retry_after_seconds(headers, fallback: float) -> float:
@@ -578,18 +785,23 @@ def _request_completion(
     if compaction.changed:
         messages[:] = compaction.messages
         print(
-            f"[Session] Auto-compacted ({compaction.reason}; {compaction.turns} turns): "
-            f"~{compaction.before_tokens} -> ~{compaction.after_tokens} tokens "
-            f"(target {compaction.target_tokens:.0f})."
+            f"[Session] Auto-compacted ({compaction.turns} turns): "
+            f"~{compaction.before_tokens} -> ~{compaction.after_tokens} tokens, "
+            f"saved ~{compaction.reduction} ({compaction.percent_reduction:.0f}%), "
+            f"target {compaction.target_tokens:.0f} "
+            f"{'reached' if compaction.reached_target else 'not reached'}. "
+            f"Reason: {compaction.reason}."
         )
     elif (
         config.DEBUG_TOKENS
         and compaction.eligible
         and compaction.before_tokens > compaction.threshold_tokens
     ):
+        # Eligible and over threshold, yet nothing was worth changing: say why,
+        # including the protected floor, instead of silently retrying every turn.
         print(
-            f"[Session] Auto-compaction did not reduce the request further "
-            f"(~{compaction.after_tokens} tokens): {compaction.reason}."
+            f"[Session] Auto-compaction left the request at ~{compaction.after_tokens} "
+            f"tokens (floor ~{compaction.floor_tokens}): {compaction.reason}."
         )
 
     payload, approx, fits, use_tools = _prepare_payload(
@@ -829,15 +1041,20 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
             messages.append({"role": "assistant", "content": message})
             raise AgentError(message)
 
-        # Fallback for models that write the tool call as JSON text instead of using
-        # the native field. The result is replayed as a real assistant.tool_calls
-        # entry: a role:"tool" message without one is rejected with a 400, which is
-        # why the old fabricated id stopped the loop on the next iteration.
+        # Fallback for models that write the tool call as text instead of using
+        # the native field. The result is replayed as real assistant.tool_calls
+        # entries: a role:"tool" message without one is rejected with a 400,
+        # which is why the old fabricated id stopped the loop on the next
+        # iteration.
         fallback_assistant = None
         if not detected_tool_calls and not final_iteration:
-            fallback = _parse_text_tool_call(content)
-            if fallback is not None:
-                func_name, arguments_json = fallback
+            bare_json = _parse_text_tool_call(content)
+            minimax_calls = (
+                None if bare_json is not None else _parse_minimax_tool_calls(content)
+            )
+
+            if bare_json is not None:
+                func_name, arguments_json = bare_json
                 call_id = f"call_{uuid.uuid4().hex[:12]}"
                 print(f"[Agent Info] Captured text-based tool call -> '{func_name}'")
 
@@ -859,6 +1076,41 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
                             "type": "function",
                             "function": {"name": func_name, "arguments": arguments_json},
                         }
+                    ],
+                }
+            elif minimax_calls is not None:
+                if not minimax_calls:
+                    # Serialization was present but no complete call could be
+                    # read: half an invoke must not run, and the raw protocol
+                    # text must not be shown to the user as an answer. The raw
+                    # message stays in the history so a retry has the context.
+                    message = (
+                        "I wrote a tool call as text, but it was malformed or cut "
+                        "off, so nothing was executed. Ask me to retry that step."
+                    )
+                    print(f"[Agent Warning] {message}")
+                    messages.append(_message_dict(response_message))
+                    raise AgentError(message)
+
+                call_ids = [f"call_{uuid.uuid4().hex[:12]}" for _ in minimax_calls]
+                names = ", ".join(f"'{name}'" for name, _ in minimax_calls)
+                print(f"[Agent Info] Captured text-based tool call(s) -> {names}")
+                detected_tool_calls = [
+                    types.SimpleNamespace(
+                        id=call_id,
+                        function=types.SimpleNamespace(name=name, arguments=arguments),
+                    )
+                    for call_id, (name, arguments) in zip(call_ids, minimax_calls)
+                ]
+                fallback_assistant = {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                        for call_id, (name, arguments) in zip(call_ids, minimax_calls)
                     ],
                 }
 
