@@ -291,6 +291,10 @@ def get_tooling():
         if problem:
             return problem
 
+        path_problem = _workspace_path_error(name, arguments)
+        if path_problem:
+            return path_problem
+
         # memory.md is inside the workspace, so the agent's own write_file can
         # replace everything it has saved. Keep the previous copy first.
         if name == "write_file" and _touches_memory(arguments):
@@ -363,6 +367,49 @@ _PATH_ARGUMENTS = {
     "run_python_file": "file_path",
     "list_directory": "directory_path",
 }
+
+_WORKSPACE_PATH_ARGUMENTS = {
+    **_PATH_ARGUMENTS,
+    "write_file": "file_path",
+}
+
+
+def _workspace_path_error(name: str, arguments: dict) -> str | None:
+    """Reject paths that resolve outside the configured workspace.
+
+    Resolving before checking also rejects symlinks (including symlinked parent
+    directories) that leave the workspace. Python execution itself is not
+    confined by this check and still has the host user's filesystem permissions.
+    """
+    key = _WORKSPACE_PATH_ARGUMENTS.get(name)
+    raw = arguments.get(key) if key else None
+    if name == "run_python_code":
+        raw = arguments.get("save_as")
+        if isinstance(raw, str) and raw:
+            path = Path(raw)
+            if path.suffix != ".py":
+                path = path.with_suffix(".py")
+        else:
+            return None
+    elif name == "list_directory" and (raw is None or raw == ""):
+        return None  # the server defines an empty directory as workspace root
+    elif not isinstance(raw, str) or not raw.strip():
+        return None
+    else:
+        path = Path(raw)
+
+    try:
+        workspace = config.WORKSPACE_DIR.resolve()
+        target = (path if path.is_absolute() else workspace / path).resolve()
+    except (OSError, RuntimeError) as exc:
+        return f"Error: cannot safely resolve {name} path: {exc}"
+
+    if target != workspace and workspace not in target.parents:
+        return (
+            f"Error: path '{raw}' resolves outside the workspace ({workspace}). "
+            "Use a path within the workspace root."
+        )
+    return None
 
 
 def _workspace_listing(limit: int = 25) -> str:
