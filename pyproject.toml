@@ -2,7 +2,7 @@
 name = "agent-harness"
 version = "0.1.0"
 description = "A local OpenAI-compatible LLM agent harness with MCP tools"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "openai==3.46.0",
     "python-dotenv==1.2.4",
