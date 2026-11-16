@@ -97,6 +97,19 @@ class SessionSafetyTestCase(unittest.TestCase):
         self.assertEqual(session.load_session(), messages)
         self.assertNotEqual(self.path.read_bytes(), self.original)
 
+    def test_session_save_failure_does_not_terminate_repl(self):
+        with mock.patch.object(main_module, "save_session", side_effect=OSError("disk full")):
+            output = io.StringIO()
+            with mock.patch.object(sys, "argv", ["agent", "--no-session"]), mock.patch.object(
+                main_module.providers, "resolve", return_value=self._endpoint()
+            ), mock.patch.object(main_module.models, "active", return_value="test-model"), mock.patch.object(
+                main_module, "_describe", return_value="empty"
+            ), mock.patch.object(main_module, "_budget_line", return_value="test budget"), mock.patch(
+                "builtins.input", side_effect=["hello", EOFError()]
+            ), mock.patch.object(main_module, "run_agent", return_value="ok"), contextlib.redirect_stdout(output):
+                main_module.main()
+        self.assertIn("Could not save conversation", output.getvalue())
+
     def test_a_failed_normal_run_keeps_the_existing_conversation(self):
         self._run_main(
             [],

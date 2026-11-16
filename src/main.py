@@ -73,7 +73,7 @@ def _fetch_models(provider: str) -> list[str]:
         print(f"[Model] {exc}")
         return []
 
-    print(f"[Model] Querying {endpoint.base_url}/models ...")
+    print(f"[Model] Querying {providers.redact_url(endpoint.base_url)}/models ...")
     try:
         ids = list_models(provider)
     except RuntimeError as exc:
@@ -210,6 +210,11 @@ def main():
     set_session_enabled(not args.no_session)
 
     try:
+        config.validate_config()
+    except ValueError as exc:
+        raise SystemExit(f"[Configuration Error] {exc}")
+
+    try:
         config.require_supported_interpreter()
     except RuntimeError as exc:
         raise SystemExit(f"[Environment Error] {exc}")
@@ -249,7 +254,7 @@ def main():
 
     print("==================================================")
     print("🤖 Custom Python AI Agent Harness Initialized")
-    print(f"Provider: {endpoint.label} ({endpoint.name}) | {endpoint.base_url}")
+    print(f"Provider: {endpoint.label} ({endpoint.name}) | {providers.redact_url(endpoint.base_url)}")
     print(f"Auth: {key_source} | model: {active_model}")
     print(f"Budget: {_budget_line(provider)} | history: {history}")
     print("Type /help for commands, or 'exit' / 'quit' to close.")
@@ -321,11 +326,17 @@ def main():
             print(f"\n[Harness Error] {exc}")
             continue
         finally:
-            save_session(messages)
+            try:
+                save_session(messages)
+            except OSError as exc:
+                print(f"\n[Session Warning] Could not save conversation: {exc}")
 
         print(f"\nAgent:\n{response}")
 
-    save_session(messages)
+    try:
+        save_session(messages)
+    except OSError as exc:
+        print(f"[Session Warning] Could not save conversation: {exc}")
 
 
 if __name__ == "__main__":

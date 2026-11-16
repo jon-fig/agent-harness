@@ -8,7 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from src import agent
+from src import agent, providers
 
 
 class FakeHTTPError(Exception):
@@ -150,6 +150,35 @@ class RetryPolicyTestCase(unittest.TestCase):
         self.assertIs(result, self.response)
         self.assertEqual(client.calls, 2)
         sleeper.assert_called_once()
+
+    def test_no_retry_delay_after_final_429(self):
+        with self.assertRaisesRegex(RuntimeError, "kept failing"):
+            self._run([FakeHTTPError(429, {"retry-after": "30"})], max_retries=0)
+
+    def test_no_retry_delay_after_final_5xx(self):
+        with self.assertRaisesRegex(RuntimeError, "kept failing"):
+            self._run([FakeHTTPError(500)], max_retries=0)
+
+
+class DiagnosticRedactionTestCase(unittest.TestCase):
+    def test_url_redaction_removes_userinfo_query_and_fragment(self):
+        self.assertEqual(
+            providers.redact_url("https://user:secret@example.test/v1?token=abc#frag"),
+            "https://example.test/v1",
+        )
+
+    def test_error_redaction_removes_key_and_embedded_url_secrets(self):
+        endpoint = providers.Provider(
+            name="custom", label="Custom", base_url="https://host/v1",
+            api_key="api-secret", api_key_source="CUSTOM_API_KEY",
+            default_model="model", local=False,
+        )
+        result = providers.redact_error(
+            "failed api-secret https://user:pw@host/v1?key=abc", endpoint
+        )
+        self.assertNotIn("api-secret", result)
+        self.assertNotIn("pw", result)
+        self.assertNotIn("key=abc", result)
 
 
 if __name__ == "__main__":

@@ -907,7 +907,7 @@ def _request_completion(
         except Exception as exc:
             status = getattr(exc, "status_code", None)
             headers = getattr(getattr(exc, "response", None), "headers", None) or {}
-            error_text = str(exc).lower()
+            error_text = providers.redact_error(exc).lower()
 
             if (
                 status == 400
@@ -951,6 +951,8 @@ def _request_completion(
                 continue
 
             if status == 429:
+                if attempt > LLM_MAX_RETRIES:
+                    break
                 wait = _retry_after_seconds(headers, delay)
                 print(f"[Agent] Rate limited; waiting {wait:.0f}s (attempt {attempt}).")
                 time.sleep(wait)
@@ -958,6 +960,8 @@ def _request_completion(
                 continue
 
             if status is not None and 500 <= int(status) < 600:
+                if attempt > LLM_MAX_RETRIES:
+                    break
                 wait = min(delay, 30.0) + random.uniform(0, 0.5)
                 print(f"[Agent] Provider error {status}; retrying in {wait:.1f}s.")
                 time.sleep(wait)
@@ -1065,7 +1069,9 @@ def run_agent(user_prompt: str, messages: list, provider: str | None = None) -> 
             messages.append({"role": "assistant", "content": message})
             raise AgentError(message) from exc
         except Exception as exc:
-            raise AgentError(f"Error communicating with LLM provider: {exc}") from exc
+            raise AgentError(
+                f"Error communicating with LLM provider: {providers.redact_error(exc)}"
+            ) from exc
 
         choice = response.choices[0]
         response_message = choice.message
