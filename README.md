@@ -36,11 +36,13 @@ history until the model answers in prose. Details:
 
 ## Quick start
 
+**Requirements:** Python 3.12 or later and
+[uv](https://docs.astral.sh/uv/getting-started/installation/).
+
 **One virtual environment serves everything.** The MCP tool server is installed
 next to the interpreter that runs the harness, so the harness interpreter, the
 server executable, the interpreter used by `run_python_code` / `run_python_file`,
 the package target and the package query are all the same uv-managed `.venv`.
-Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first.
 
 ```bash
 uv sync --locked                         # Windows and POSIX

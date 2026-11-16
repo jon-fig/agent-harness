@@ -3,7 +3,7 @@
 ## Setting up
 
 Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and
-Python 3.10 or later. One uv-managed virtual environment serves the harness, MCP
+Python 3.12 or later. One uv-managed virtual environment serves the harness, MCP
 server executable, Python tools and approved package installs. `uv.lock` pins
 the complete resolved graph; `pyproject.toml` pins the direct dependencies.
 
@@ -24,7 +24,10 @@ not import pandas or NumPy.
 The compatible MCP pair is intentionally pinned: `mcp==1.30.0` and
 `mcp-python-interpreter==1.2.3`. The interpreter server imports
 `mcp.server.fastmcp`, which the MCP SDK 2.x line removed. Keep both in one
-environment and rerun the suite before changing either pin.
+environment and rerun the suite before changing either pin. `pip==26.3` is
+also a direct runtime pin because the upstream server's package-listing tool
+calls `python -m pip list`; uv-created environments otherwise need not include
+pip.
 
 ## Starting the harness
 
@@ -117,8 +120,9 @@ them. Add durable dependencies to `pyproject.toml` instead.
 
 ## Conventions for contributions
 
-- Tests must not require network access; the unified-environment test is the
-  only one that spawns the real server, and it skips cleanly without it.
+- Tests do not call an LLM API. Tokenizer tests may download tiktoken encoding
+  data on first use if it is not already cached. The unified-environment test
+  spawns the real local server and skips cleanly when it is unavailable.
 - `tests/test_config_defaults.py` cross-checks defaults against `.env.example`,
   so changing a default means updating both.
 - Best-effort writers (usage, calibration, session) must treat a read-only
