@@ -9,6 +9,8 @@ dependencies = [
     "tiktoken==0.14.0",
     "mcp==1.30.0",
     "mcp-python-interpreter==1.2.3",
+    # The upstream interpreter's package listing tool invokes `python -m pip list`.
+    "pip==26.3",
 ]
 
 [project.optional-dependencies]
