@@ -15,6 +15,7 @@ dist/
 # --- Virtual Environments ---
 .venv/
 .venv-mcp/
+.venv-uv/
 env/
 venv/
 
@@ -33,4 +34,4 @@ workspace/
 Thumbs.db
 
 # --- Ignore AI agent instruction files
-AGENTS.md 
+AGENTS.md

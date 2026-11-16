@@ -189,14 +189,14 @@ class MCPToolBridge:
             raise RuntimeError(
                 "MCP server executable not found. It is installed with the harness, so "
                 f"use the interpreter that runs the agent ({config.MCP_PYTHON}): "
-                f"\"{config.MCP_PYTHON}\" -m pip install -r requirements.txt "
+                f"uv sync --python {config.MCP_PYTHON} "
                 f"(looked in: {looked_in}). Or set MCP_SERVER_COMMAND explicitly."
             )
         if not os.path.exists(self.command) and shutil.which(self.command) is None:
             raise RuntimeError(
                 f"MCP server executable not found: {self.command}. Install it into the "
                 f"environment that runs the harness ({config.MCP_PYTHON}): "
-                f"\"{config.MCP_PYTHON}\" -m pip install -r requirements.txt, or point "
+                f"uv sync --python {config.MCP_PYTHON}, or point "
                 "MCP_SERVER_COMMAND at an existing install."
             )
 

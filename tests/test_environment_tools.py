@@ -101,6 +101,18 @@ class InstallApprovalTestCase(unittest.TestCase):
     def setUp(self):
         approval.set_approver(None)
         self.addCleanup(approval.set_approver, None)
+        self._uv = mock.patch.object(
+            environment.shutil, "which", return_value="/tmp/uv"
+        )
+        self._uv.start()
+        self.addCleanup(self._uv.stop)
+        self._run_uv = mock.patch.object(
+            environment.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+        self._run_uv.start()
+        self.addCleanup(self._run_uv.stop)
 
     def test_refuses_to_install_into_a_global_interpreter(self):
         with mock.patch.object(sys, "prefix", "/usr"), mock.patch.object(
@@ -150,7 +162,6 @@ class InstallApprovalTestCase(unittest.TestCase):
         }
         bridge = FakeBridge(
             {
-                "install_package": "Successfully installed pandas==2.2.0 in system.",
                 "run_python_code": json.dumps(report),
             }
         )
@@ -162,14 +173,12 @@ class InstallApprovalTestCase(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         self.assertIn("pandas==2.2.0", prompts[0])
         self.assertIn(config.MCP_PYTHON, prompts[0])
+        self.assertIn("outside uv.lock", prompts[0])
 
-        install_name, install_args = bridge.calls[0]
-        self.assertEqual(install_name, "install_package")
-        self.assertEqual(install_args["package_name"], "pandas==2.2.0")
-        # Never "default"/"system" chosen by the model, never another conda env.
-        self.assertEqual(install_args["environment"], "system")
+        command = environment.subprocess.run.call_args.args[0]
+        self.assertEqual(command, ["/tmp/uv", "pip", "install", "--python", config.MCP_PYTHON, "pandas==2.2.0"])
 
-        verify_name, verify_args = bridge.calls[1]
+        verify_name, verify_args = bridge.calls[0]
         self.assertEqual(verify_name, "run_python_code")
         self.assertIn('"pandas"', verify_args["code"])
         self.assertIn("Verified", result)
@@ -186,12 +195,7 @@ class InstallApprovalTestCase(unittest.TestCase):
             "source": "metadata",
             "imports": {"dotenv": None},
         }
-        bridge = FakeBridge(
-            {
-                "install_package": "Successfully installed python-dotenv",
-                "run_python_code": json.dumps(report),
-            }
-        )
+        bridge = FakeBridge({"run_python_code": json.dumps(report)})
         with mock.patch("src.mcp_client.get_bridge", return_value=bridge):
             result = environment.install_package({"package_name": "python-dotenv"})
 
@@ -200,12 +204,13 @@ class InstallApprovalTestCase(unittest.TestCase):
 
     def test_a_failed_install_is_reported(self):
         approval.set_approver(lambda prompt: True)
-        bridge = FakeBridge({"install_package": "Error installing pandas: no network"})
-        with mock.patch("src.mcp_client.get_bridge", return_value=bridge):
+        with mock.patch.object(
+            environment.subprocess, "run",
+            return_value=SimpleNamespace(returncode=1, stderr="no network", stdout=""),
+        ), mock.patch("src.mcp_client.get_bridge", return_value=FakeBridge()):
             result = environment.install_package({"package_name": "pandas"})
         self.assertIn("failed", result)
         self.assertIn("no network", result)
-        self.assertEqual(bridge.names(), ["install_package"])
 
     def test_an_unimportable_package_is_reported_after_install(self):
         approval.set_approver(lambda prompt: True)
@@ -217,12 +222,7 @@ class InstallApprovalTestCase(unittest.TestCase):
             "source": "metadata",
             "imports": {"pandas": "ModuleNotFoundError: pandas"},
         }
-        bridge = FakeBridge(
-            {
-                "install_package": "Successfully installed pandas",
-                "run_python_code": json.dumps(report),
-            }
-        )
+        bridge = FakeBridge({"run_python_code": json.dumps(report)})
         with mock.patch("src.mcp_client.get_bridge", return_value=bridge):
             result = environment.install_package({"package_name": "pandas"})
         self.assertIn("still fails", result)
@@ -260,6 +260,15 @@ class DispatchApprovalTestCase(unittest.TestCase):
     def setUp(self):
         approval.set_approver(None)
         self.addCleanup(approval.set_approver, None)
+        which = mock.patch.object(environment.shutil, "which", return_value="/tmp/uv")
+        which.start()
+        self.addCleanup(which.stop)
+        uv_run = mock.patch.object(
+            environment.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+        uv_run.start()
+        self.addCleanup(uv_run.stop)
 
     def test_dispatch_never_installs_without_approval(self):
         approval.set_approver(lambda prompt: False)
@@ -274,7 +283,6 @@ class DispatchApprovalTestCase(unittest.TestCase):
         approval.set_approver(lambda prompt: True)
         bridge = FakeBridge(
             {
-                "install_package": "Successfully installed pandas",
                 "run_python_code": json.dumps(
                     {
                         "package": "pandas",
@@ -290,7 +298,7 @@ class DispatchApprovalTestCase(unittest.TestCase):
         with mock.patch("src.mcp_client.get_bridge", return_value=bridge):
             _, dispatch = agent.get_tooling()
             result = dispatch("install_package", {"package_name": "pandas"})
-        self.assertEqual(bridge.names()[0], "install_package")
+        self.assertEqual(bridge.names()[0], "run_python_code")
         self.assertIn("Installed", result)
 
     def test_deny_mode_blocks_even_when_no_prompt_is_possible(self):
