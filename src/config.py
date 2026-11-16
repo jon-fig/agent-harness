@@ -129,14 +129,14 @@ AI_MODEL = os.getenv("AI_MODEL") or ""
 # One virtual environment serves the whole agent. The server is a console script
 # installed next to the interpreter that runs the harness, so the harness
 # interpreter, the server executable, the interpreter used by run_python_code /
-# run_python_file, the pip target and the package query all name the same
+# run_python_file, the uv package-install target and the package query all name the same
 # environment (`.venv` by default). That is what keeps `import pandas` from
 # succeeding in one tool and failing in another.
 #
 # It must be launched through its console script: the package has no __main__, so
 # `python -m mcp_python_interpreter` is not supported upstream.
 SERVER_SCRIPT_NAME = "mcp-python-interpreter"
-# The interpreter the tools execute code with, and the one pip installs into.
+# The interpreter the tools execute code with, and the one uv installs into.
 MCP_PYTHON = sys.executable
 # Virtualenv layout: Scripts\ on Windows, bin/ everywhere else.
 BIN_DIR_NAME = "Scripts" if os.name == "nt" else "bin"
@@ -167,7 +167,7 @@ def interpreter_problem() -> str | None:
     return (
         "the harness is not running inside a virtual environment "
         f"(interpreter: {sys.executable}, prefix: {sys.prefix}). "
-        "Start it with the environment that has requirements.txt installed: "
+        "Start it with the uv-managed project environment (run `uv sync --locked`): "
         f"\"{project_python()}\" -m src.main"
     )
 

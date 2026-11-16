@@ -67,6 +67,7 @@ class ServerResolutionTestCase(unittest.TestCase):
             self.assertIn("not running inside a virtual environment", problem)
             self.assertIn(".venv", problem)
             self.assertIn("-m src.main", problem)
+            self.assertIn("uv sync --locked", problem)
             with self.assertRaises(RuntimeError):
                 config.require_supported_interpreter()
 
