@@ -15,8 +15,6 @@ dist/
 # --- Virtual Environments ---
 .venv/
 .venv-mcp/
-.venv-pip-backup-*/
-.venv-uv-backup-*/
 env/
 venv/
 
