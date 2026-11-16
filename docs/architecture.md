@@ -62,7 +62,8 @@ and tool calls against one OpenAI-compatible endpoint.
 8. **Tool execution** — MCP tools go through the stdio bridge
    (`src/mcp_client.py`); `save_memory` and `python_environment_info` are handled
    in-process by the harness; `install_package` is intercepted and routed through
-   the approval gate. Duplicate calls re-execute by default (opt-in dedup) and a
+   the approval gate, then installed with `uv pip install` into the active
+   interpreter. Duplicate calls re-execute by default (opt-in dedup) and a
    per-turn execution cap bounds how many run.
 9. **Loop and answer** — the loop repeats until the model returns text with no
    tool calls, or the final iteration is reached. The last iteration runs
@@ -122,5 +123,6 @@ non-fatal.
   Conversation history lives outside the workspace so the agent cannot rewrite
   it.
 - **One environment.** The harness interpreter, the MCP server executable, the
-  interpreter used by the Python tools, the pip target and the package query are
-  all the same virtual environment; a global interpreter is refused.
+  interpreter used by the Python tools, the uv package-install target and the
+  package query are all the same virtual environment; a global interpreter is
+  refused.

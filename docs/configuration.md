@@ -98,6 +98,7 @@ automatically at midnight UTC.
 | Variable | Default | Purpose |
 |---|---|---|
 | `MCP_INSTALL_APPROVAL` | `ask` | `ask` prompts on the terminal that started the agent; `deny` refuses every install without asking. A session without an interactive terminal denies by default. |
+| `UV_COMMAND` | `uv` | Executable name or path used for user-approved runtime package installs. The command must resolve on `PATH` or be an executable path. |
 
 ## Optional sandbox configuration
 

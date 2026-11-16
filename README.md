@@ -39,22 +39,32 @@ history until the model answers in prose. Details:
 **One virtual environment serves everything.** The MCP tool server is installed
 next to the interpreter that runs the harness, so the harness interpreter, the
 server executable, the interpreter used by `run_python_code` / `run_python_file`,
-the pip target and the package query are all the same `.venv`.
+the package target and the package query are all the same uv-managed `.venv`.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first.
 
 ```bash
-python -m venv .venv
-.venv/Scripts/python.exe -m pip install -r requirements.txt      # Windows
-.venv/bin/python        -m pip install -r requirements.txt       # POSIX
+uv sync --locked                         # Windows and POSIX
+```
 
-cp .env.example .env        # then set LLM_PROVIDER and the key/URL/model
-.venv/Scripts/python.exe -m src.main          # Windows
-.venv/bin/python        -m src.main           # POSIX
+Copy `.env.example` to `.env` (`Copy-Item .env.example .env` in PowerShell,
+`cp .env.example .env` on POSIX), then configure the provider and credentials.
+
+Then start with the environment's interpreter:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.main
+```
+
+```bash
+.venv/bin/python -m src.main
 ```
 
 - `python src/main.py` does not work (absolute `src.*` imports); use
   `-m src.main` with the venv's interpreter. A system Python is refused with a
   clear message instead of mixing the client and tool environments.
-- `requirements.txt` pins `mcp==1.30.0` and `mcp-python-interpreter==1.2.3`
+- `pyproject.toml` pins direct dependencies and `uv.lock` pins the resolved
+  dependency graph, including `mcp==1.30.0` and
+  `mcp-python-interpreter==1.2.3`
   (the server imports `mcp.server.fastmcp`, removed in `mcp` 2.x), so client and
   server share one `mcp` release in one environment.
 
@@ -115,7 +125,8 @@ overrides: [docs/providers-and-models.md](docs/providers-and-models.md).
 ├── .agent/                 # session.json, models.json, usage.json, tokenizer.json
 ├── .env.example
 ├── docs/                   # the documentation described below
-├── requirements.txt
+├── pyproject.toml          # direct dependencies and optional data extra
+├── uv.lock                 # full resolved dependency graph
 ├── tests/                  # unittest suite
 ├── workspace/              # working directory: the agent's files + memory.md
 └── src/
@@ -129,7 +140,7 @@ overrides: [docs/providers-and-models.md](docs/providers-and-models.md).
     ├── usage.py            # daily request/token accounting and projected guard
     ├── usage_report.py     # normalised provider-reported token usage
     ├── mcp_client.py       # stdio MCP bridge with output truncation
-    ├── environment.py      # environment diagnostic + confirmed package install
+    ├── environment.py      # environment diagnostic + approved uv package install
     ├── approval.py         # harness-enforced yes/no before a mutating call
     ├── memory.py           # capped, atomic memory writer
     ├── session.py          # persisted conversation history
