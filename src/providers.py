@@ -22,10 +22,38 @@ model (this is how a self-hosted OpenAI-compatible server is added).
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 from src import config
+
+
+def redact_url(value: str) -> str:
+    """Remove URL credentials, query parameters, and fragments for diagnostics."""
+    try:
+        parts = urlsplit(value)
+        if not parts.scheme or not parts.netloc:
+            return value
+        host = parts.hostname or ""
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        if parts.port:
+            host = f"{host}:{parts.port}"
+        return urlunsplit((parts.scheme, host, parts.path, "", ""))
+    except ValueError:
+        return "<invalid endpoint URL>"
+
+
+def redact_error(error: object, endpoint: "Provider | None" = None) -> str:
+    """Redact configured keys and URL secrets from third-party error text."""
+    text = str(error)
+    if endpoint and endpoint.api_key:
+        text = text.replace(endpoint.api_key, "[REDACTED]")
+    urls = re.findall(r"https?://[^\s\"'<>]+", text)
+    for url in urls:
+        text = text.replace(url, redact_url(url))
+    return text
 
 
 @dataclass(frozen=True)
@@ -164,7 +192,7 @@ class Provider:
     def describe(self) -> str:
         key = self.api_key_source or ("not required" if self.local else "missing")
         return (
-            f"{self.label} ({self.name}) | {self.base_url} | "
+            f"{self.label} ({self.name}) | {redact_url(self.base_url)} | "
             f"key: {key} | default model: {self.default_model}"
         )
 

@@ -33,4 +33,4 @@ workspace/
 Thumbs.db
 
 # --- Ignore AI agent instruction files
-AGENTS.md 
+AGENTS.md

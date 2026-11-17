@@ -69,7 +69,7 @@ presentation:
 | `clear_session` | Reset the persistent Python session |
 | `list_installed_packages` | Packages installed in the venv that runs agent code |
 | `list_python_environments` | Interpreters the tool server can use |
-| `install_package` | pip install into the agent venv, **only after user approval** |
+| `install_package` | uv install into the agent venv, **only after user approval** |
 | `python_environment_info` | Harness tool: interpreter, version, virtualenv, cwd, workspace, key package versions |
 | `save_memory` | Harness tool: append a note to `workspace/memory.md` |
 
@@ -89,7 +89,7 @@ harness interpreter (REPL, agent loop, MCP client)
         │  same .venv
         ├── mcp-python-interpreter console script (the server executable)
         └── interpreter used by run_python_code / run_python_file,
-            the pip target and the package query
+            the uv package target and the package query
 ```
 
 All three roles resolve to the same virtual environment. That is what keeps
@@ -113,10 +113,12 @@ Before any call reaches the server:
    mismatches are named explicitly so the model can self-correct. Only the
    simple JSON-Schema subset is checked; `$ref`/combinators are left to the
    server, which owns the real validation.
-4. **Path normalisation** — a redundant leading `workspace/` is stripped from
-   path arguments, and missing relative paths are answered with the workspace
-   location and a listing of the nearest existing directory, instead of a
-   generic server error.
+4. **Path normalisation and checks** — a redundant leading `workspace/` is
+   stripped from path arguments. Resolved paths for file tools and Python
+   `save_as` output are checked against the workspace, including existing
+   symlinks; missing relative paths are answered with the workspace location
+   and a listing of the nearest existing directory, instead of a generic server
+   error. These harness checks do not constrain arbitrary Python execution.
 5. **Result formatting** — the MCP result is flattened to text, and long output
    is middle-truncated (see
    [token budget](token-budget-and-compaction.md)).
@@ -126,20 +128,25 @@ Before any call reaches the server:
 The agent cannot install anything on its own say-so. `install_package` is
 intercepted in the dispatch path and routed through `src/environment.py`, which:
 
-1. validates the argument (`name` or `name==version`; URLs, local paths, extras
-   and pip flags are rejected — the requirement is passed to pip as a single
-   argv element, never through a shell);
+1. validates the argument (`name` or a package name followed by a version
+   operator such as `==`, `>=` or `~=`; URLs, local paths, extras and command
+   flags are rejected);
 2. refuses to target a global interpreter;
 3. asks the person at the terminal (`src/approval.py`), showing the package and
    the target interpreter. Anything but an explicit `y`/`yes` is a no; a session
    without an interactive terminal denies by default;
-4. installs through the MCP server into the environment that runs agent code;
+4. invokes `uv pip install --python <active-interpreter> <requirement>` directly
+   (without a shell) into the environment that runs agent code. This one-off
+   install is outside `uv.lock`; a later `uv sync` may remove it. Put durable
+   project dependencies in `pyproject.toml` and update the lock instead;
 5. verifies the import with that same interpreter.
 
 `MCP_INSTALL_APPROVAL` controls step 3: `ask` (default) prompts on the terminal;
 `deny` refuses every request without prompting. Upgrades are refused on purpose
-(the agent must name an explicit version, so unrelated packages are never
-silently replaced).
+(the tool's separate `upgrade` option is rejected). To make the approved
+request reproducible, prefer `name==version`; version ranges are accepted but
+can resolve to a newer release. `UV_COMMAND` selects the uv executable (default
+`uv`) used for this operation.
 
 Import verification is careful about names: distribution names and import names
 are different namespaces (`scikit-learn` → `sklearn`, `python-dotenv` →
@@ -158,9 +165,10 @@ The MCP server is launched with `--dir` pointing at `workspace/`, so:
 
 **`workspace/` is a working directory, not a security boundary.**
 `run_python_code` executes real Python with the host user's filesystem and
-network access. The `workspace/` restriction holds only for the file tools'
-*default* path resolution — it is a convention, not OS policy. For an OS-level
-sandbox, wrap the MCP server with a launcher you trust:
+network access. The harness checks that paths passed to its file tools and
+`save_as` remain inside the resolved workspace, but this is not OS policy for
+the Python interpreter. For an OS-level sandbox, wrap the MCP server with a
+launcher you trust:
 
 ```dotenv
 MCP_SANDBOX_COMMAND=bwrap

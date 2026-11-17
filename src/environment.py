@@ -17,11 +17,14 @@ Order of operations for an install (all enforced here, not in the model's prose)
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 from importlib import metadata as importlib_metadata
 
-from src import approval, config
+from src import approval, config, providers
 
 # ``name`` or ``name==1.2.3`` / ``name>=1.2``. URLs, local paths, extras, wheel
 # files and flags are rejected: the package name is passed to pip as a single
@@ -289,13 +292,14 @@ def install_package(arguments: dict) -> str:
             "Error: refusing to install — the harness is running on a global "
             f"interpreter ({sys.executable}), and packages must not be installed "
             "there. Run the agent from its project environment instead: "
-            "python -m venv .venv && .venv/bin/python -m pip install -r requirements.txt"
+            "uv sync --python .venv"
         )
 
     prompt = (
         f"[Approval] The agent wants to install '{requirement}' into the environment "
         f"that runs its code:\n    {config.MCP_PYTHON}\n"
-        "This changes the environment. Approve this install?"
+        "This changes the environment outside uv.lock; a later uv sync may remove it. "
+        "Add durable project dependencies to pyproject.toml. Approve this install?"
     )
     if not approval.request(prompt):
         return (
@@ -304,37 +308,44 @@ def install_package(arguments: dict) -> str:
             "the task without it."
         )
 
+    uv = shutil.which(os.getenv("UV_COMMAND", "uv"))
+    if not uv:
+        return "Error: installing package failed: uv is not on PATH. Install uv and retry."
     try:
-        from src.mcp_client import get_bridge
-
-        bridge = get_bridge()
-        result = str(
-            bridge.call(
-                "install_package",
-                {"package_name": requirement, "environment": "system"},
-            )
+        result = subprocess.run(
+            [uv, "pip", "install", "--python", config.MCP_PYTHON, requirement],
+            capture_output=True,
+            text=True,
+            timeout=config.MCP_CALL_TIMEOUT,
+            check=False,
         )
-    except Exception as exc:  # noqa: BLE001 - reported, never raised at the model
-        return f"Error: installing '{requirement}' failed: {type(exc).__name__}: {exc}"
-
-    if "success" not in result.lower():
-        return f"Error: installing '{requirement}' failed:\n{result}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"Error: installing '{requirement}' failed: {providers.redact_error(exc)}"
+    if result.returncode:
+        detail = providers.redact_error(result.stderr or result.stdout or "uv install failed")
+        return f"Error: installing '{requirement}' failed:\n{detail}"
 
     candidates = module_names(name)
     script = _VERIFY_SCRIPT.replace("__PACKAGE__", json.dumps(name)).replace(
         "__CANDIDATES__", json.dumps(candidates)
     )
-    verification = str(
-        bridge.call(
-            "run_python_code",
-            {
-                "code": script,
-                "execution_mode": "inline",
-                "session_id": "default",
-                "environment": "system",
-            },
+    try:
+        from src.mcp_client import get_bridge
+
+        bridge = get_bridge()
+        verification = str(
+            bridge.call(
+                "run_python_code",
+                {
+                    "code": script,
+                    "execution_mode": "inline",
+                    "session_id": "default",
+                    "environment": "system",
+                },
+            )
         )
-    )
+    except Exception as exc:  # noqa: BLE001 - report verification failure to the model
+        return f"Installed {requirement}, but verification failed: {providers.redact_error(exc)}"
 
     report = _parse_json_line(verification)
     if not isinstance(report, dict):
@@ -357,7 +368,8 @@ def install_package(arguments: dict) -> str:
         modules = ", ".join(working)
         return (
             f"Installed {requirement} {version} (approved by the user). Verified in "
-            f"the same interpreter: import {modules} succeeded."
+            f"the same interpreter: import {modules} succeeded. This environment-only "
+            "install is not recorded in uv.lock."
         )
 
     if imports and report.get("source") == "metadata":
@@ -376,5 +388,5 @@ def install_package(arguments: dict) -> str:
         f"Installed {requirement} {version} (approved by the user). The "
         f"distribution is present; its import name could not be confirmed from "
         f"installed metadata (tried: {checked}), so the import itself was not "
-        "verified."
+        "verified. This environment-only install is not recorded in uv.lock."
     )

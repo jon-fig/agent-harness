@@ -1,8 +1,68 @@
 import json
+import math
 import os
 import sys
 from pathlib import Path
 from dotenv import dotenv_values
+
+_CONFIG_ERRORS: list[str] = []
+
+
+def _number(name: str, default, kind):
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = kind(raw)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("must be finite")
+        return value
+    except (TypeError, ValueError):
+        _CONFIG_ERRORS.append(f"{name} must be a valid {kind.__name__}; using {default} temporarily")
+        return default
+
+
+def _json_list(name: str, default: list):
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        _CONFIG_ERRORS.append(f"{name} must contain a JSON array")
+        return default
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        _CONFIG_ERRORS.append(f"{name} must contain a JSON array of strings")
+        return default
+    return value
+
+
+def validate_config() -> None:
+    """Raise a concise startup error for malformed or unsafe scalar settings."""
+    errors = list(_CONFIG_ERRORS)
+    for name, value, minimum in (
+        ("MCP_CALL_TIMEOUT", MCP_CALL_TIMEOUT, 0.1),
+        ("MCP_STARTUP_TIMEOUT", MCP_STARTUP_TIMEOUT, 0.1),
+        ("LLM_TIMEOUT", LLM_TIMEOUT, 0.1),
+        ("MODEL_DISCOVERY_TIMEOUT", MODEL_DISCOVERY_TIMEOUT, 0.1),
+        ("MAX_ITERATIONS", MAX_ITERATIONS, 1),
+        ("MAX_TOOL_CALLS_PER_TURN", MAX_TOOL_CALLS_PER_TURN, 1),
+        ("MAX_INPUT_TOKENS", MAX_INPUT_TOKENS, 1),
+        ("MAX_OUTPUT_TOKENS", MAX_OUTPUT_TOKENS, 1),
+        ("LLM_MAX_RETRIES", LLM_MAX_RETRIES, 0),
+        ("TOOL_OUTPUT_MAX_CHARS", TOOL_OUTPUT_MAX_CHARS, 1),
+        ("MEMORY_MAX_CHARS", MEMORY_MAX_CHARS, 1),
+        ("HISTORY_KEEP_EXCHANGES", HISTORY_KEEP_EXCHANGES, 0),
+        ("AUTO_COMPACT_MIN_TURNS", AUTO_COMPACT_MIN_TURNS, 1),
+        ("OLLAMA_MAX_INPUT_TOKENS", OLLAMA_MAX_INPUT_TOKENS, 1),
+    ):
+        if value < minimum:
+            errors.append(f"{name} must be at least {minimum}")
+    for name, value in (("AUTO_COMPACT_THRESHOLD", AUTO_COMPACT_THRESHOLD), ("AUTO_COMPACT_TARGET", AUTO_COMPACT_TARGET)):
+        if not math.isfinite(value) or value < 0:
+            errors.append(f"{name} must be a finite, non-negative number")
+    if errors:
+        raise ValueError("Invalid configuration:\n- " + "\n- ".join(errors))
 
 # Project root directories
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -69,14 +129,14 @@ AI_MODEL = os.getenv("AI_MODEL") or ""
 # One virtual environment serves the whole agent. The server is a console script
 # installed next to the interpreter that runs the harness, so the harness
 # interpreter, the server executable, the interpreter used by run_python_code /
-# run_python_file, the pip target and the package query all name the same
+# run_python_file, the uv package-install target and the package query all name the same
 # environment (`.venv` by default). That is what keeps `import pandas` from
 # succeeding in one tool and failing in another.
 #
 # It must be launched through its console script: the package has no __main__, so
 # `python -m mcp_python_interpreter` is not supported upstream.
 SERVER_SCRIPT_NAME = "mcp-python-interpreter"
-# The interpreter the tools execute code with, and the one pip installs into.
+# The interpreter the tools execute code with, and the one uv installs into.
 MCP_PYTHON = sys.executable
 # Virtualenv layout: Scripts\ on Windows, bin/ everywhere else.
 BIN_DIR_NAME = "Scripts" if os.name == "nt" else "bin"
@@ -107,7 +167,7 @@ def interpreter_problem() -> str | None:
     return (
         "the harness is not running inside a virtual environment "
         f"(interpreter: {sys.executable}, prefix: {sys.prefix}). "
-        "Start it with the environment that has requirements.txt installed: "
+        "Start it with the uv-managed project environment (run `uv sync --locked`): "
         f"\"{project_python()}\" -m src.main"
     )
 
@@ -144,16 +204,16 @@ def resolve_mcp_server_command() -> str:
 
 
 MCP_SERVER_COMMAND = os.getenv("MCP_SERVER_COMMAND") or resolve_mcp_server_command()
-MCP_SERVER_ARGS = json.loads(os.getenv("MCP_SERVER_ARGS", "null")) or [
+MCP_SERVER_ARGS = _json_list("MCP_SERVER_ARGS", []) or [
     "--dir", str(WORKSPACE_DIR),
     "--python-path", MCP_PYTHON,
 ]
-MCP_CALL_TIMEOUT = float(os.getenv("MCP_CALL_TIMEOUT", "300"))
-MCP_STARTUP_TIMEOUT = float(os.getenv("MCP_STARTUP_TIMEOUT", "60"))
+MCP_CALL_TIMEOUT = _number("MCP_CALL_TIMEOUT", 300.0, float)
+MCP_STARTUP_TIMEOUT = _number("MCP_STARTUP_TIMEOUT", 60.0, float)
 # Optional OS sandbox: this launcher and its arguments are prepended to the MCP
 # server command, so bwrap/firejail/nsjail/container-exec can confine the tools.
 MCP_SANDBOX_COMMAND = os.getenv("MCP_SANDBOX_COMMAND", "").strip()
-MCP_SANDBOX_ARGS = json.loads(os.getenv("MCP_SANDBOX_ARGS") or "null") or []
+MCP_SANDBOX_ARGS = _json_list("MCP_SANDBOX_ARGS", [])
 # Package installation mutates the environment, so the harness itself asks before
 # it runs: "ask" prompts on the terminal that started the agent, "deny" refuses
 # every request. The model cannot approve its own install by writing about it.
@@ -168,10 +228,10 @@ MCP_INSTALL_APPROVAL = os.getenv("MCP_INSTALL_APPROVAL", "ask").strip().lower() 
 # counting input AND output. A request whose input does not fit is rejected with
 # 413; a drained window throttles the rest with 429. These caps exist so a whole
 # coding turn stays inside one bucket.
-MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "8"))
+MAX_ITERATIONS = _number("MAX_ITERATIONS", 8, int)
 # MAX_ITERATIONS bounds model calls; one response can request many tool calls, so
 # executions get their own per-turn ceiling.
-MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "20"))
+MAX_TOOL_CALLS_PER_TURN = _number("MAX_TOOL_CALLS_PER_TURN", 20, int)
 # Identical arguments do not guarantee identical results (a clock, a random seed,
 # a file another call just wrote), so repeats execute by default. Set to 1 only
 # for providers that loop on the same call.
@@ -184,21 +244,21 @@ DEDUPE_TOOL_CALLS = os.getenv("DEDUPE_TOOL_CALLS", "0").strip().lower() in (
 # The generation limit asked of the model. It is a *token* request and is clamped
 # per model/provider by src/models.py (context window, TPM bucket), so a generic
 # 4000 never overrides a lower model-specific maximum.
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "4000"))
-MAX_INPUT_TOKENS = int(os.getenv("MAX_INPUT_TOKENS", "6500"))
-LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "120"))
-LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+MAX_OUTPUT_TOKENS = _number("MAX_OUTPUT_TOKENS", 4000, int)
+MAX_INPUT_TOKENS = _number("MAX_INPUT_TOKENS", 6500, int)
+LLM_TIMEOUT = _number("LLM_TIMEOUT", 120.0, float)
+LLM_MAX_RETRIES = _number("LLM_MAX_RETRIES", 2, int)
 # GET /models is a control-plane call, not a completion: a slow or blocked
 # discovery endpoint should not hold up the REPL for the completion timeout.
-MODEL_DISCOVERY_TIMEOUT = float(os.getenv("MODEL_DISCOVERY_TIMEOUT", "20"))
+MODEL_DISCOVERY_TIMEOUT = _number("MODEL_DISCOVERY_TIMEOUT", 20.0, float)
 
 # Enforced before a request is built: one tool result, the memory block, and how
 # many recent tool exchanges are replayed verbatim. TOOL_OUTPUT_MAX_CHARS is a
 # *character* cap applied where tool output enters history; it is not a token
 # limit and does not have to equal MAX_OUTPUT_TOKENS.
-TOOL_OUTPUT_MAX_CHARS = int(os.getenv("TOOL_OUTPUT_MAX_CHARS", "4000"))
-MEMORY_MAX_CHARS = int(os.getenv("MEMORY_MAX_CHARS", "1200"))
-HISTORY_KEEP_EXCHANGES = int(os.getenv("HISTORY_KEEP_EXCHANGES", "2"))
+TOOL_OUTPUT_MAX_CHARS = _number("TOOL_OUTPUT_MAX_CHARS", 4000, int)
+MEMORY_MAX_CHARS = _number("MEMORY_MAX_CHARS", 1200, int)
+HISTORY_KEEP_EXCHANGES = _number("HISTORY_KEEP_EXCHANGES", 2, int)
 # Auto-compaction is evaluated by the agent against the complete request (system
 # prompt + tool schemas + history), not just the history text. It is eligible only
 # from AUTO_COMPACT_MIN_TURNS user turns onward; it fires when the measured
@@ -214,17 +274,15 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 AUTO_COMPACT = _env_flag("AUTO_COMPACT", True)
-AUTO_COMPACT_MIN_TURNS = int(
-    os.getenv("AUTO_COMPACT_MIN_TURNS")
-    or os.getenv("AUTOCOMPACT_AFTER_TURNS")
-    or "2"
-)
-AUTO_COMPACT_THRESHOLD = float(
-    os.getenv("AUTO_COMPACT_THRESHOLD")
-    or os.getenv("AUTOCOMPACT_TOKEN_FRACTION")
-    or "0.6"
-)
-AUTO_COMPACT_TARGET = float(os.getenv("AUTO_COMPACT_TARGET", "0.5"))
+if os.getenv("AUTO_COMPACT_MIN_TURNS"):
+    AUTO_COMPACT_MIN_TURNS = _number("AUTO_COMPACT_MIN_TURNS", 2, int)
+else:
+    AUTO_COMPACT_MIN_TURNS = _number("AUTOCOMPACT_AFTER_TURNS", 2, int)
+if os.getenv("AUTO_COMPACT_THRESHOLD"):
+    AUTO_COMPACT_THRESHOLD = _number("AUTO_COMPACT_THRESHOLD", 0.6, float)
+else:
+    AUTO_COMPACT_THRESHOLD = _number("AUTOCOMPACT_TOKEN_FRACTION", 0.6, float)
+AUTO_COMPACT_TARGET = _number("AUTO_COMPACT_TARGET", 0.5, float)
 # The chars/4 fallback self-calibrates from provider-reported prompt tokens so a
 # model with an exotic tokenizer does not silently undercount the request. The
 # learned ratios live in .agent/tokenizer.json; set this to 0 to keep it fixed.
@@ -237,4 +295,4 @@ DEBUG_TOKENS = os.getenv("DEBUG_TOKENS", "0") == "1"
 
 # Ollama has no tokens-per-minute ceiling, only a context window, so local runs
 # use a much larger budget (qwen2.5-coder is commonly served with 32K context).
-OLLAMA_MAX_INPUT_TOKENS = int(os.getenv("OLLAMA_MAX_INPUT_TOKENS", "32000"))
+OLLAMA_MAX_INPUT_TOKENS = _number("OLLAMA_MAX_INPUT_TOKENS", 32000, int)

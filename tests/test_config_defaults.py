@@ -90,6 +90,22 @@ class ConfigDefaultsTestCase(unittest.TestCase):
             self.assertEqual(config.MAX_OUTPUT_TOKENS, 777)
             self.assertEqual(config.TOOL_OUTPUT_MAX_CHARS, 888)
 
+    def test_malformed_numeric_value_is_reported_during_validation(self):
+        errors_before = list(config._CONFIG_ERRORS)
+        try:
+            config._CONFIG_ERRORS.clear()
+            with mock.patch.dict(os.environ, {"LLM_TIMEOUT": "not-a-number"}):
+                self.assertEqual(config._number("LLM_TIMEOUT", 120.0, float), 120.0)
+            with self.assertRaisesRegex(ValueError, "LLM_TIMEOUT"):
+                config.validate_config()
+        finally:
+            config._CONFIG_ERRORS[:] = errors_before
+
+    def test_invalid_bounds_are_reported(self):
+        with mock.patch.object(config, "MAX_ITERATIONS", 0):
+            with self.assertRaisesRegex(ValueError, "MAX_ITERATIONS"):
+                config.validate_config()
+
     def test_documented_defaults_match_the_code(self):
         text = (config.ROOT_DIR / ".env.example").read_text(encoding="utf-8")
         documented = {}

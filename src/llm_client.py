@@ -39,7 +39,7 @@ def get_llm_client(
     """
     client, endpoint = build_client(provider)
     active = model or models.active(endpoint.name)
-    print(f"[Client] Connected to {endpoint.label} ({endpoint.base_url}) (Model: {active})")
+    print(f"[Client] Connected to {endpoint.label} ({providers.redact_url(endpoint.base_url)}) (Model: {active})")
     return client, active
 
 
@@ -55,7 +55,10 @@ def list_models(provider: str | None = None) -> list[str]:
     try:
         page = client.models.list()
     except Exception as exc:
-        raise RuntimeError(f"could not list models from {endpoint.base_url}: {exc}") from exc
+        raise RuntimeError(
+            f"could not list models from {providers.redact_url(endpoint.base_url)}: "
+            f"{providers.redact_error(exc, endpoint)}"
+        ) from exc
 
     data = getattr(page, "data", None) or []
     ids = sorted({getattr(item, "id", "") for item in data if getattr(item, "id", "")})

@@ -2,30 +2,40 @@
 
 ## Setting up
 
-One virtual environment serves the whole project: the harness interpreter, the
-MCP server executable, the interpreter used by the Python tools, the pip target
-and the package query must all be the same `.venv`.
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and
+Python 3.12 or later. One uv-managed virtual environment serves the harness, MCP
+server executable, Python tools and approved package installs. `uv.lock` pins
+the complete resolved graph; `pyproject.toml` pins the direct dependencies.
 
 ```bash
-python -m venv .venv
-.venv/Scripts/python.exe -m pip install -r requirements.txt      # Windows
-.venv/bin/python        -m pip install -r requirements.txt       # POSIX
+uv sync --locked
+# Optional pandas and NumPy for data-analysis tasks:
+uv sync --locked --extra data
 
-cp .env.example .env        # then set LLM_PROVIDER and the key/URL/model
+cp .env.example .env        # POSIX; then configure provider and credentials
 ```
 
-`requirements.txt` pins `mcp==1.30.0` and `mcp-python-interpreter==1.2.3`
-because the server imports `mcp.server.fastmcp`, which `mcp` 2.x removed. Client
-and server must share one `mcp` release, which is why they are installed
-together into the main environment.
+On Windows PowerShell, use `Copy-Item .env.example .env` for the copy step.
+`uv sync` creates and synchronizes `.venv`; use `--locked` to fail if the lock
+file needs an update. Syncing an existing `.venv` may remove packages that are
+not in the project lock. The `data` extra is optional because core modules do
+not import pandas or NumPy.
+
+The compatible MCP pair is intentionally pinned: `mcp==1.30.0` and
+`mcp-python-interpreter==1.2.3`. The interpreter server imports
+`mcp.server.fastmcp`, which the MCP SDK 2.x line removed. Keep both in one
+environment and rerun the suite before changing either pin. `pip==26.3` is
+also a direct runtime pin because the upstream server's package-listing tool
+calls `python -m pip list`; uv-created environments otherwise need not include
+pip.
 
 ## Starting the harness
 
 Always start it with the venv's interpreter, as a module:
 
 ```bash
-.venv/Scripts/python.exe -m src.main          # Windows
-.venv/bin/python        -m src.main           # POSIX
+.venv/Scripts/python.exe -m src.main          # Windows PowerShell
+.venv/bin/python -m src.main                  # POSIX
 ```
 
 - `python src/main.py` does not work (absolute `src.*` imports); use
@@ -41,11 +51,14 @@ Always start it with the venv's interpreter, as a module:
 The suite uses the standard library's `unittest` (no extra dependency):
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -v          # POSIX
-.venv\Scripts\python.exe -m unittest discover -s tests -v  # Windows
+uv run --locked python -m unittest discover -s tests -v
 ```
 
-Run a single file with `python -m unittest tests.test_budgets -v`.
+The equivalent direct interpreter commands are
+`.venv/bin/python -m unittest discover -s tests -v` (POSIX) and
+`.venv\Scripts\python.exe -m unittest discover -s tests -v` (Windows).
+Run one test module with
+`uv run --locked python -m unittest discover -s tests -p 'test_budgets.py' -v`.
 
 ## Test organization
 
@@ -73,9 +86,9 @@ Run a single file with `python -m unittest tests.test_budgets -v`.
 
 `tests/test_unified_env.py` starts the **real** MCP server. It is skipped
 automatically when `mcp-python-interpreter` is not installed in the active
-environment. It is the end-to-end proof that one environment serves the whole
-agent: `run_python_code`, `run_python_file` and the package query all report the
-harness interpreter, with `pandas` importable from both roles.
+environment. It checks that `run_python_code`, `run_python_file` and package
+queries use the harness interpreter. Its pandas import check runs only when the
+optional package is installed (`uv sync --locked --extra data`).
 
 Because it launches a child process, it is slower than the rest of the suite;
 everything else runs in-process with fakes.
@@ -84,17 +97,32 @@ everything else runs in-process with fakes.
 
 | Symptom | Cause / fix |
 |---|---|
-| `RuntimeError: the harness is not running inside a virtual environment` | Started with a system Python. Use `.venv/bin/python -m src.main` (or the Windows equivalent). |
-| `MCP server executable not found` | `requirements.txt` not installed into the environment running the harness, or a custom `MCP_SERVER_COMMAND` points nowhere. Install with the harness interpreter, or set `MCP_SERVER_COMMAND`. |
+| `RuntimeError: the harness is not running inside a virtual environment` | Started with a system Python. Run `uv sync --locked`, then use `.venv/bin/python -m src.main` (or the Windows equivalent). |
+| `MCP server executable not found` | `uv sync --locked` was not run for the environment running the harness, or a custom `MCP_SERVER_COMMAND` points nowhere. |
 | Startup error mentioning a `TaskGroup` | The server failed during the stdio handshake; the bridge prints the server's stderr and probes the executable directly to separate "cannot run" from "handshake failed". |
-| `ModuleNotFoundError` for `mcp.server.fastmcp` | A `mcp` 2.x release got installed. Reinstall the pinned versions from `requirements.txt`. |
+| `ModuleNotFoundError` for `mcp.server.fastmcp` | The MCP SDK and interpreter server versions are incompatible. Restore the locked environment with `uv sync --locked`. |
 | An obsolete `.venv-mcp` directory | Not used by any current version; it can be deleted by hand. |
 | Imports work in one tool and fail in another | Two different environments are involved. Verify with `python_environment_info`, which runs code through the actual server and warns about interpreter mismatches. |
 
+## Dependency updates
+
+Direct dependencies use exact versions in `pyproject.toml`; `uv.lock` records
+the complete graph. For a deliberate direct-dependency update, change its
+specifier, run `uv lock`, inspect the lockfile diff and upstream release notes,
+then run `uv sync --locked` and the test suite. Use `uv audit --locked` to query
+OSV for known advisories when network access is available. Do not treat a
+successful audit as proof that packages are safe or that the tool server is
+sandboxed.
+
+Agent-approved runtime installs use `uv pip install` in the active environment.
+They are not added to `pyproject.toml` or `uv.lock`; a later `uv sync` may remove
+them. Add durable dependencies to `pyproject.toml` instead.
+
 ## Conventions for contributions
 
-- Tests must not require network access; the unified-environment test is the
-  only one that spawns the real server, and it skips cleanly without it.
+- Tests do not call an LLM API. Tokenizer tests may download tiktoken encoding
+  data on first use if it is not already cached. The unified-environment test
+  spawns the real local server and skips cleanly when it is unavailable.
 - `tests/test_config_defaults.py` cross-checks defaults against `.env.example`,
   so changing a default means updating both.
 - Best-effort writers (usage, calibration, session) must treat a read-only

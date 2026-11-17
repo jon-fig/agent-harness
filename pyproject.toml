@@ -1,0 +1,30 @@
+[project]
+name = "agent-harness"
+version = "0.1.0"
+description = "A local OpenAI-compatible LLM agent harness with MCP tools"
+requires-python = ">=3.12"
+dependencies = [
+    "openai==3.46.0",
+    "python-dotenv==1.2.4",
+    "tiktoken==0.14.0",
+    "mcp==1.30.0",
+    "mcp-python-interpreter==1.2.3",
+    # The upstream interpreter's package listing tool invokes `python -m pip list`.
+    "pip==26.3",
+]
+
+[project.optional-dependencies]
+data = ["pandas", "numpy"]
+
+[project.scripts]
+agent-harness = "src.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.uv]
+package = true
